@@ -2,6 +2,20 @@
 
 Protects Emby/Jellyfin playback by automatically pausing library tasks and throttling downloads during active streaming.
 
+---
+
+### We've Reinvented Contributing
+
+Every issue in this repo is **AI-Ready** — structured with full context, file paths, implementation guides, acceptance criteria, and a ready-to-use AI prompt at the bottom.
+
+**Pick an issue. Copy the prompt. Paste into your AI tool. Submit a PR.**
+
+No codebase knowledge required. No onboarding docs to read. Just pick an issue and go.
+
+[**Browse Issues →**](https://github.com/wolffcatskyy/emby-playback-guardian/issues)
+
+---
+
 ## Features
 
 - **Playback Protection** — Pauses library scans and metadata refreshes while media is playing
@@ -93,3 +107,7 @@ The guardian uses a two-layer approach to detect stuck tasks:
 2. **Absolute timeout (fallback):** If a task has been running longer than `STUCK_SCAN_TIMEOUT` seconds (default: 2 hours), it is killed regardless of progress. This catches edge cases where progress reporting is broken.
 
 Set `STUCK_STALL_MINUTES=0` to disable progress-based detection and rely only on the absolute timeout.
+
+## License
+
+MIT
