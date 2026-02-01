@@ -1,0 +1,32 @@
+services:
+  emby-playback-guardian:
+    image: ghcr.io/wolffcatskyy/emby-playback-guardian:latest
+    container_name: emby-playback-guardian
+    restart: unless-stopped
+    environment:
+      # Media Server (required)
+      EMBY_URL: "http://emby:8096"
+      EMBY_API_KEY: "your-api-key"
+      SERVER_TYPE: "emby"
+      # qBittorrent (optional)
+      # QBIT_URL: "http://qbittorrent:8080"
+      # QBIT_USERNAME: "admin"
+      # QBIT_PASSWORD: "your-password"
+      # SABnzbd (optional)
+      # SABNZBD_URL: "http://sabnzbd:8080"
+      # SABNZBD_API_KEY: "your-sab-key"
+      # Disk I/O (optional)
+      # DISK_DEVICES: "sda,nvme0n1"
+      # Behavior
+      POLL_INTERVAL: "30"
+      STUCK_SCAN_TIMEOUT: "7200"
+      DRY_RUN: "true"
+      TZ: "America/New_York"
+    # volumes:
+    #   - /proc/diskstats:/host/proc/diskstats:ro
+    mem_limit: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
