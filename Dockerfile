@@ -15,4 +15,9 @@ COPY guardian.py .
 RUN adduser -D -u 1000 guardian
 USER guardian
 
+EXPOSE 8095
+
+HEALTHCHECK --interval=60s --timeout=5s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8095/health')" || exit 1
+
 CMD ["python", "-u", "guardian.py"]

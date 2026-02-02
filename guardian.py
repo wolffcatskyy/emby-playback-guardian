@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Emby Playback Guardian — Protects playback by pausing tasks and throttling downloads.
+Emby Playback Guardian -- Protects playback by pausing tasks and throttling downloads.
 
 Monitors Emby/Jellyfin media servers and automatically:
   - Pauses library scans and metadata refreshes during active playback
@@ -11,19 +11,23 @@ Monitors Emby/Jellyfin media servers and automatically:
 https://github.com/wolffcatskyy/emby-playback-guardian
 """
 
+import json
 import logging
 import os
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+
+# --- Configuration ---------------------------------------------------------------
 
 def env(key, default=None):
     """Get environment variable, stripping whitespace."""
@@ -80,8 +84,24 @@ PAUSABLE_TASKS = [t.strip() for t in env(
     "Video preview thumbnail extraction,Scan Metadata Folder"
 ).split(",") if t.strip()]
 
+# Retry behavior
+MAX_RETRIES = env_int("MAX_RETRIES", 3)
+RETRY_BACKOFF = env_int("RETRY_BACKOFF", 2)
+RETRY_BASE_DELAY = env_int("RETRY_BASE_DELAY", 1)
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
+# Startup retry (wait for Emby to become available)
+STARTUP_RETRIES = env_int("STARTUP_RETRIES", 10)
+STARTUP_RETRY_DELAY = env_int("STARTUP_RETRY_DELAY", 30)
+
+# Health check / metrics
+HEALTH_PORT = env_int("HEALTH_PORT", 8095)
+
+# Notifications (optional)
+DISCORD_WEBHOOK_URL = env("DISCORD_WEBHOOK_URL", "")
+WEBHOOK_URL = env("WEBHOOK_URL", "")
+
+
+# --- Logging ---------------------------------------------------------------------
 
 def setup_logging():
     """Configure structured logging."""
@@ -95,7 +115,47 @@ def setup_logging():
 log = setup_logging()
 
 
-# ─── Data Types ───────────────────────────────────────────────────────────────
+# --- Retry Helper ----------------------------------------------------------------
+
+def retry_request(func, *args, max_retries=None, **kwargs):
+    """Execute an HTTP request function with exponential backoff retry.
+
+    Retries on: ConnectionError, Timeout, HTTP 429, HTTP 5xx.
+    Does NOT retry on: HTTP 4xx (except 429).
+    """
+    retries = max_retries if max_retries is not None else MAX_RETRIES
+    last_exception = None
+
+    for attempt in range(retries + 1):
+        try:
+            resp = func(*args, **kwargs)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < retries:
+                    delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
+                    log.debug(f"HTTP {resp.status_code} -- retrying in {delay}s "
+                              f"(attempt {attempt + 1}/{retries})")
+                    time.sleep(delay)
+                    continue
+            return resp
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            last_exception = e
+            if attempt < retries:
+                delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
+                log.debug(f"{type(e).__name__} -- retrying in {delay}s "
+                          f"(attempt {attempt + 1}/{retries})")
+                time.sleep(delay)
+            else:
+                log.warning(f"Request failed after {retries} retries: {e}")
+                raise
+
+    if last_exception:
+        raise last_exception
+    resp.raise_for_status()
+    return resp
+
+
+# --- Data Types ------------------------------------------------------------------
 
 @dataclass
 class TaskInfo:
@@ -116,14 +176,17 @@ class TaskInfo:
 @dataclass
 class GuardianState:
     """Tracks what the guardian has done so it can undo correctly."""
-    tasks_we_paused: dict = field(default_factory=dict)     # task_id -> name
+    tasks_we_paused: dict = field(default_factory=dict)
     downloads_throttled: bool = False
     qbit_alt_was_on: bool = False
     sab_original_speed: int = 100
     throttle_reason: str = ""
-    task_run_tracker: dict = field(default_factory=dict)    # task_id -> first_seen
-    task_progress_tracker: dict = field(default_factory=dict)  # task_id -> (progress, last_change_time)
+    task_run_tracker: dict = field(default_factory=dict)
+    task_progress_tracker: dict = field(default_factory=dict)
     stuck_kills: list = field(default_factory=list)
+    last_successful_cycle: float = 0.0
+    last_cycle_error: str = ""
+    emby_connected: bool = False
 
     def clear_paused_tasks(self):
         self.tasks_we_paused.clear()
@@ -134,14 +197,11 @@ class GuardianState:
         if task_id in self.task_progress_tracker:
             last_progress, last_change = self.task_progress_tracker[task_id]
             if progress != last_progress:
-                # Progress moved — update
                 self.task_progress_tracker[task_id] = (progress, now)
                 return 0
             else:
-                # No change — return stall duration
                 return now - last_change
         else:
-            # First time seeing this task
             self.task_progress_tracker[task_id] = (progress, now)
             return 0
 
@@ -159,7 +219,67 @@ class GuardianState:
         })
 
 
-# ─── Emby/Jellyfin Client ────────────────────────────────────────────────────
+@dataclass
+class MetricsCollector:
+    """Collects Prometheus-compatible metrics from guardian state."""
+    poll_cycles_total: int = 0
+    poll_errors_total: int = 0
+    tasks_paused_total: int = 0
+    stuck_kills_total: int = 0
+    last_cycle_duration: float = 0.0
+    playback_active: int = 0
+    downloads_throttled: int = 0
+    tasks_currently_paused: int = 0
+    tasks_currently_running: int = 0
+    disk_io_percent: float = 0.0
+
+    def to_prometheus(self):
+        """Render metrics in Prometheus text exposition format."""
+        lines = []
+
+        def metric(name, help_text, mtype, value):
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {mtype}")
+            lines.append(f"{name} {value}")
+
+        metric("guardian_poll_cycles_total",
+               "Total number of poll cycles executed", "counter",
+               self.poll_cycles_total)
+        metric("guardian_poll_errors_total",
+               "Total number of poll cycle errors", "counter",
+               self.poll_errors_total)
+        metric("guardian_tasks_paused_total",
+               "Total number of tasks paused since startup", "counter",
+               self.tasks_paused_total)
+        metric("guardian_stuck_kills_total",
+               "Total number of stuck tasks killed since startup", "counter",
+               self.stuck_kills_total)
+        metric("guardian_playback_active",
+               "Whether playback is currently active (0 or 1)", "gauge",
+               self.playback_active)
+        metric("guardian_downloads_throttled",
+               "Whether downloads are currently throttled (0 or 1)", "gauge",
+               self.downloads_throttled)
+        metric("guardian_tasks_paused_current",
+               "Number of tasks currently paused by guardian", "gauge",
+               self.tasks_currently_paused)
+        metric("guardian_tasks_running_current",
+               "Number of tasks currently running on server", "gauge",
+               self.tasks_currently_running)
+        metric("guardian_disk_io_percent",
+               "Current disk I/O utilization percentage", "gauge",
+               round(self.disk_io_percent, 1))
+        metric("guardian_last_cycle_duration_seconds",
+               "Duration of the last poll cycle in seconds", "gauge",
+               round(self.last_cycle_duration, 3))
+        metric("guardian_info",
+               "Guardian version info", "gauge",
+               '1{version="' + __version__ + '"}')
+
+        return "\n".join(lines) + "\n"
+
+
+# --- Emby/Jellyfin Client -------------------------------------------------------
 
 class EmbyClient:
     """Emby/Jellyfin REST API client for sessions and task management."""
@@ -170,24 +290,23 @@ class EmbyClient:
         self.server_type = server_type
         self.session = requests.Session()
         self.session.headers["X-Emby-Token"] = api_key
-        # Emby uses /emby/ prefix, Jellyfin doesn't
         self.prefix = "/emby" if server_type == "emby" else ""
 
     def _url(self, path):
         return f"{self.base}{self.prefix}{path}"
 
     def _get(self, path, timeout=10):
-        resp = self.session.get(self._url(path), timeout=timeout)
+        resp = retry_request(self.session.get, self._url(path), timeout=timeout)
         resp.raise_for_status()
         return resp.json()
 
     def _post(self, path, timeout=10):
-        resp = self.session.post(self._url(path), timeout=timeout)
+        resp = retry_request(self.session.post, self._url(path), timeout=timeout)
         resp.raise_for_status()
         return resp
 
     def _delete(self, path, timeout=10):
-        resp = self.session.delete(self._url(path), timeout=timeout)
+        resp = retry_request(self.session.delete, self._url(path), timeout=timeout)
         resp.raise_for_status()
         return resp
 
@@ -213,7 +332,7 @@ class EmbyClient:
         sessions = self.get_active_sessions()
         if sessions:
             for s in sessions:
-                log.info(f"  Active: {s['user']} \u2192 '{s['item']}' "
+                log.info(f"  Active: {s['user']} -> '{s['item']}' "
                          f"({s['play_method']}) on {s['device']}")
         return len(sessions) > 0
 
@@ -243,7 +362,6 @@ class EmbyClient:
                     first_seen_running=first_seen,
                 ))
 
-        # Clean up tracker for tasks no longer running
         for tid in list(state_tracker.keys()):
             if tid not in active_ids:
                 del state_tracker[tid]
@@ -269,7 +387,7 @@ class EmbyClient:
             return False
 
 
-# ─── qBittorrent Client ──────────────────────────────────────────────────────
+# --- qBittorrent Client ----------------------------------------------------------
 
 class QBitClient:
     """qBittorrent Web API client with session cookie management."""
@@ -297,20 +415,22 @@ class QBitClient:
         if not self._authenticated:
             self._login()
         kwargs.setdefault("timeout", 10)
-        resp = self.session.request(method, f"{self.base}{endpoint}", **kwargs)
+        resp = retry_request(
+            self.session.request, method, f"{self.base}{endpoint}", **kwargs
+        )
         if resp.status_code == 403:
             self._login()
-            resp = self.session.request(method, f"{self.base}{endpoint}", **kwargs)
+            resp = retry_request(
+                self.session.request, method, f"{self.base}{endpoint}", **kwargs
+            )
         resp.raise_for_status()
         return resp
 
     def is_alt_speed_enabled(self):
-        """Check if alternative speed limits are active."""
         resp = self._request("GET", "/api/v2/transfer/speedLimitsMode")
         return resp.text.strip() == "1"
 
     def toggle_alt_speed(self):
-        """Toggle alternative speed mode."""
         self._request("POST", "/api/v2/transfer/toggleSpeedLimitsMode")
 
     def enable_alt_speed(self):
@@ -318,7 +438,7 @@ class QBitClient:
             self.toggle_alt_speed()
             log.info("qBittorrent: enabled alternative speed limits")
             return True
-        return False  # already enabled
+        return False
 
     def disable_alt_speed(self):
         if self.is_alt_speed_enabled():
@@ -339,7 +459,7 @@ class QBitClient:
             return False
 
 
-# ─── SABnzbd Client ──────────────────────────────────────────────────────────
+# --- SABnzbd Client --------------------------------------------------------------
 
 class SABnzbdClient:
     """SABnzbd API client (stateless, uses apikey in query params)."""
@@ -350,17 +470,17 @@ class SABnzbdClient:
 
     def _api(self, mode, **params):
         params.update({"mode": mode, "apikey": self.api_key, "output": "json"})
-        resp = requests.get(f"{self.base}/api", params=params, timeout=10)
+        resp = retry_request(
+            requests.get, f"{self.base}/api", params=params, timeout=10
+        )
         resp.raise_for_status()
         return resp.json()
 
     def get_speed_limit(self):
-        """Get current speed limit percentage (100 = unlimited)."""
         result = self._api("queue")
         return int(result.get("queue", {}).get("speedlimit", "100") or "100")
 
     def set_speed_limit(self, pct):
-        """Set speed limit as percentage."""
         self._api("config", name="speedlimit", value=str(pct))
         log.info(f"SABnzbd: speed limit set to {pct}%")
 
@@ -377,7 +497,65 @@ class SABnzbdClient:
             return False
 
 
-# ─── Disk I/O Monitor ─────────────────────────────────────────────────────────
+# --- Notification Client ---------------------------------------------------------
+
+class NotificationClient:
+    """Sends notifications via Discord webhook and/or generic webhook."""
+
+    def __init__(self, discord_url="", webhook_url="", dry_run=False):
+        self.discord_url = discord_url
+        self.webhook_url = webhook_url
+        self.dry_run = dry_run
+
+    @property
+    def enabled(self):
+        return bool(self.discord_url or self.webhook_url)
+
+    def notify(self, event, message, level="info"):
+        """Send a notification. Non-blocking -- errors are logged, not raised."""
+        if not self.enabled:
+            return
+        prefix = "[DRY RUN] " if self.dry_run else ""
+        full_message = f"{prefix}{message}"
+        if self.discord_url:
+            self._send_discord(event, full_message, level)
+        if self.webhook_url:
+            self._send_webhook(event, full_message, level)
+
+    def _send_discord(self, event, message, level):
+        """Post to Discord webhook using embeds."""
+        colors = {"info": 3447003, "warning": 16776960, "error": 15158332}
+        payload = {
+            "embeds": [{
+                "title": f"Guardian: {event}",
+                "description": message,
+                "color": colors.get(level, 3447003),
+                "footer": {"text": "Emby Playback Guardian"}
+            }]
+        }
+        try:
+            resp = requests.post(self.discord_url, json=payload, timeout=5)
+            resp.raise_for_status()
+        except Exception as e:
+            log.warning(f"Discord notification failed: {e}")
+
+    def _send_webhook(self, event, message, level):
+        """POST JSON to generic webhook URL."""
+        payload = {
+            "event": event,
+            "message": message,
+            "level": level,
+            "source": "emby-playback-guardian",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        try:
+            resp = requests.post(self.webhook_url, json=payload, timeout=5)
+            resp.raise_for_status()
+        except Exception as e:
+            log.warning(f"Webhook notification failed: {e}")
+
+
+# --- Disk I/O Monitor ------------------------------------------------------------
 
 class DiskMonitor:
     """Parse /proc/diskstats to calculate disk busy percentage."""
@@ -389,7 +567,6 @@ class DiskMonitor:
         self.sample_seconds = sample_seconds
 
     def _read_io_ticks(self):
-        """Read io_ticks (ms doing I/O) from /proc/diskstats per device."""
         result = {}
         try:
             with open(self.proc_path, "r") as f:
@@ -401,23 +578,19 @@ class DiskMonitor:
                             result[dev_name] = int(parts[12])
         except FileNotFoundError:
             log.warning(f"Disk stats not found at {self.proc_path} "
-                        f"\u2014 disk monitoring disabled")
+                        "-- disk monitoring disabled")
         except Exception as e:
             log.warning(f"Error reading disk stats: {e}")
         return result
 
     def get_utilization(self):
-        """Sample disk I/O, return max busy % across configured devices."""
         before = self._read_io_ticks()
         if not before:
             return 0.0
-
         time.sleep(self.sample_seconds)
         after = self._read_io_ticks()
-
         interval_ms = self.sample_seconds * 1000
         max_busy = 0.0
-
         for dev in self.devices:
             if dev in before and dev in after:
                 delta = after[dev] - before[dev]
@@ -425,11 +598,9 @@ class DiskMonitor:
                 if busy_pct > max_busy:
                     max_busy = busy_pct
                 log.debug(f"  Disk {dev}: {busy_pct:.1f}% busy")
-
         return max_busy
 
     def test(self):
-        """Verify disk monitoring is functional."""
         ticks = self._read_io_ticks()
         if ticks:
             log.info(f"Disk monitoring: {len(ticks)} device(s) found "
@@ -441,31 +612,101 @@ class DiskMonitor:
             return False
 
 
-# ─── Task Matching ────────────────────────────────────────────────────────────
+# --- Health Check & Metrics Server -----------------------------------------------
+
+class HealthMetricsHandler(BaseHTTPRequestHandler):
+    """Serves /health as JSON and /metrics in Prometheus text format."""
+    state = None
+    metrics = None
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._handle_health()
+        elif self.path == "/metrics":
+            self._handle_metrics()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _handle_health(self):
+        now = time.time()
+        last = self.state.last_successful_cycle if self.state else 0
+        age = now - last if last > 0 else float("inf")
+        max_age = POLL_INTERVAL * 3
+        healthy = age < max_age and self.state and self.state.emby_connected
+        status = 200 if healthy else 503
+        body = {
+            "status": "healthy" if healthy else "unhealthy",
+            "last_successful_cycle_ago_seconds": round(age, 1),
+            "emby_connected": self.state.emby_connected if self.state else False,
+            "downloads_throttled": self.state.downloads_throttled if self.state else False,
+            "tasks_paused": len(self.state.tasks_we_paused) if self.state else 0,
+            "stuck_kills_total": len(self.state.stuck_kills) if self.state else 0,
+            "version": __version__,
+        }
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
+    def _handle_metrics(self):
+        body = self.metrics.to_prometheus().encode() if self.metrics else b""
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         "text/plain; version=0.0.4; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_metrics_server(port, state, metrics):
+    """Start health check and metrics HTTP server in a daemon thread."""
+    HealthMetricsHandler.state = state
+    HealthMetricsHandler.metrics = metrics
+    server = HTTPServer(("0.0.0.0", port), HealthMetricsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info(f"Health/metrics endpoint: http://0.0.0.0:{port}/health "
+             f"and http://0.0.0.0:{port}/metrics")
+    return server
+
+
+# --- Task Matching ---------------------------------------------------------------
 
 def is_pausable_task(task_name):
-    """Check if a task name matches the pausable task list."""
     name_lower = task_name.lower()
     return any(p.lower() in name_lower for p in PAUSABLE_TASKS)
 
 
-# ─── Main Loop ────────────────────────────────────────────────────────────────
+# --- Main Loop -------------------------------------------------------------------
 
 def main():
-    """Main guardian loop."""
     log.info(f"Emby Playback Guardian v{__version__}")
     if DRY_RUN:
-        log.info("*** DRY RUN MODE \u2014 no actions will be taken ***")
+        log.info("*** DRY RUN MODE -- no actions will be taken ***")
 
-    # Validate required config
     if not EMBY_URL or not EMBY_API_KEY:
         log.error("EMBY_URL and EMBY_API_KEY are required")
         sys.exit(1)
 
-    # Initialize clients
     emby = EmbyClient(EMBY_URL, EMBY_API_KEY, SERVER_TYPE)
-    if not emby.test_connection():
-        log.error("Failed to connect to media server \u2014 exiting")
+
+    # Startup retry: wait for Emby to become available instead of exiting
+    connected = False
+    for attempt in range(1, STARTUP_RETRIES + 1):
+        if emby.test_connection():
+            connected = True
+            break
+        if attempt < STARTUP_RETRIES:
+            log.warning(f"Startup: Emby not available, retrying in "
+                        f"{STARTUP_RETRY_DELAY}s "
+                        f"(attempt {attempt}/{STARTUP_RETRIES})")
+            time.sleep(STARTUP_RETRY_DELAY)
+    if not connected:
+        log.error(f"Failed to connect to media server after "
+                  f"{STARTUP_RETRIES} attempts -- exiting")
         sys.exit(1)
 
     qbit = None
@@ -489,16 +730,32 @@ def main():
     else:
         log.info("Disk I/O monitoring: not configured (skipping)")
 
+    notifier = None
+    if DISCORD_WEBHOOK_URL or WEBHOOK_URL:
+        notifier = NotificationClient(DISCORD_WEBHOOK_URL, WEBHOOK_URL, DRY_RUN)
+        log.info(f"Notifications: Discord={'yes' if DISCORD_WEBHOOK_URL else 'no'}, "
+                 f"Webhook={'yes' if WEBHOOK_URL else 'no'}")
+    else:
+        log.info("Notifications: not configured (skipping)")
+
     log.info(f"Poll interval: {POLL_INTERVAL}s | "
              f"Stuck timeout: {STUCK_SCAN_TIMEOUT}s | "
              f"Stall detection: {STUCK_STALL_MINUTES}min | "
              f"I/O threshold: {IO_THRESHOLD}%")
+    log.info(f"Retry config: {MAX_RETRIES} retries, "
+             f"backoff={RETRY_BACKOFF}x, base_delay={RETRY_BASE_DELAY}s")
     log.info(f"Pausable tasks: {', '.join(PAUSABLE_TASKS)}")
-    log.info("Guardian active \u2014 monitoring started")
+    log.info("Guardian active -- monitoring started")
 
     state = GuardianState()
+    state.emby_connected = True
+    metrics = MetricsCollector()
 
-    # Graceful shutdown
+    if HEALTH_PORT:
+        start_health_metrics_server(HEALTH_PORT, state, metrics)
+    else:
+        log.info("Health/metrics: disabled (HEALTH_PORT=0)")
+
     running = True
 
     def handle_signal(signum, frame):
@@ -512,8 +769,8 @@ def main():
     cycle = 0
     while running:
         cycle += 1
+        cycle_start = time.time()
         try:
-            # ── GATHER STATE ─────────────────────────────────────────────
             playback_active = emby.has_active_playback()
             running_tasks = emby.get_running_tasks(state.task_run_tracker)
 
@@ -521,7 +778,10 @@ def main():
             if disk:
                 disk_busy = disk.get_utilization()
 
-            # Summary log every cycle
+            metrics.playback_active = 1 if playback_active else 0
+            metrics.tasks_currently_running = len(running_tasks)
+            metrics.disk_io_percent = disk_busy
+
             if running_tasks:
                 task_descs = [f"{t.name} ({t.progress:.0f}%)" for t in running_tasks]
                 task_str = ", ".join(task_descs)
@@ -533,7 +793,6 @@ def main():
                      f"({task_str}) | "
                      f"Disk I/O: {disk_busy:.0f}%")
 
-            # ── STUCK SCAN DETECTION (always active) ─────────────────────
             active_task_ids = {t.id for t in running_tasks}
             state.clean_progress_tracker(active_task_ids)
 
@@ -553,7 +812,7 @@ def main():
                                    f"> {STUCK_SCAN_TIMEOUT}s")
 
                 if kill_reason:
-                    log.warning(f"STUCK: '{task.name}' \u2014 {kill_reason}")
+                    log.warning(f"STUCK: '{task.name}' -- {kill_reason}")
                     if not DRY_RUN:
                         try:
                             emby.stop_task(task.id)
@@ -564,12 +823,15 @@ def main():
                         log.info(f"[DRY RUN] Would kill stuck task: "
                                  f"'{task.name}'")
                     state.record_stuck_kill(task.name, kill_reason)
+                    metrics.stuck_kills_total += 1
+                    if notifier:
+                        notifier.notify("Stuck Task Killed",
+                                        f"Killed '{task.name}' -- {kill_reason}",
+                                        level="warning")
                 elif stall_secs > 60:
-                    # Warn early if progress has been stalled > 1 min
                     log.debug(f"Task '{task.name}' at {task.progress:.0f}% "
-                              f"\u2014 no progress for {stall_secs / 60:.1f}min")
+                              f"-- no progress for {stall_secs / 60:.1f}min")
 
-            # ── PLAYBACK PROTECTION (pause tasks) ────────────────────────
             if playback_active:
                 for task in running_tasks:
                     if (task.id not in state.tasks_we_paused
@@ -586,16 +848,17 @@ def main():
                             log.info(f"[DRY RUN] Would pause: "
                                      f"'{task.name}'")
                         state.tasks_we_paused[task.id] = task.name
+                        metrics.tasks_paused_total += 1
+                        if notifier:
+                            notifier.notify("Task Paused",
+                                            f"Paused '{task.name}' -- playback active")
             else:
-                # Playback ended — clear our paused-tasks state
-                # Emby will re-run tasks on their normal schedule
                 if state.tasks_we_paused:
                     names = list(state.tasks_we_paused.values())
                     log.info(f"Playback ended. Clearing paused state for: "
                              f"{', '.join(names)}")
                     state.clear_paused_tasks()
 
-            # ── DOWNLOAD THROTTLING ──────────────────────────────────────
             io_saturated = disk_busy > IO_THRESHOLD
             should_throttle = playback_active or io_saturated
 
@@ -608,12 +871,10 @@ def main():
                 reason = ", ".join(reasons)
                 log.info(f"Throttling downloads ({reason})")
 
-                # qBittorrent
                 if qbit:
                     if not DRY_RUN:
                         try:
-                            state.qbit_alt_was_on = \
-                                qbit.is_alt_speed_enabled()
+                            state.qbit_alt_was_on = qbit.is_alt_speed_enabled()
                             if not state.qbit_alt_was_on:
                                 qbit.enable_alt_speed()
                         except Exception as e:
@@ -621,7 +882,6 @@ def main():
                     else:
                         log.info("[DRY RUN] Would enable qBit alt speed")
 
-                # SABnzbd
                 if sab:
                     if not DRY_RUN:
                         try:
@@ -635,11 +895,13 @@ def main():
 
                 state.downloads_throttled = True
                 state.throttle_reason = reason
+                if notifier:
+                    notifier.notify("Downloads Throttled",
+                                    f"Throttling downloads ({reason})")
 
             elif not should_throttle and state.downloads_throttled:
                 log.info(f"Restoring downloads (was: {state.throttle_reason})")
 
-                # qBittorrent — only restore if WE enabled alt speed
                 if qbit:
                     if not DRY_RUN:
                         try:
@@ -647,13 +909,12 @@ def main():
                                 qbit.disable_alt_speed()
                             else:
                                 log.debug("qBit alt speed was already on "
-                                          "\u2014 leaving as-is")
+                                          "-- leaving as-is")
                         except Exception as e:
                             log.error(f"qBittorrent restore failed: {e}")
                     else:
                         log.info("[DRY RUN] Would disable qBit alt speed")
 
-                # SABnzbd — restore to original speed
                 if sab:
                     if not DRY_RUN:
                         try:
@@ -664,17 +925,35 @@ def main():
                         log.info(f"[DRY RUN] Would restore SABnzbd to "
                                  f"{state.sab_original_speed}%")
 
+                if notifier:
+                    notifier.notify("Downloads Restored",
+                                    f"Restored downloads (was: {state.throttle_reason})")
                 state.downloads_throttled = False
                 state.throttle_reason = ""
 
+            metrics.downloads_throttled = 1 if state.downloads_throttled else 0
+            metrics.tasks_currently_paused = len(state.tasks_we_paused)
+
+            state.last_successful_cycle = time.time()
+            state.emby_connected = True
+            state.last_cycle_error = ""
+            metrics.poll_cycles_total += 1
+            metrics.last_cycle_duration = time.time() - cycle_start
+
         except requests.exceptions.ConnectionError as e:
             log.error(f"Connection error (will retry): {e}")
+            state.emby_connected = False
+            state.last_cycle_error = str(e)
+            metrics.poll_errors_total += 1
         except requests.exceptions.Timeout as e:
             log.error(f"Request timeout (will retry): {e}")
+            state.last_cycle_error = str(e)
+            metrics.poll_errors_total += 1
         except Exception as e:
             log.error(f"Unexpected error in poll cycle: {e}", exc_info=True)
+            state.last_cycle_error = str(e)
+            metrics.poll_errors_total += 1
 
-        # Sleep with early exit check
         for _ in range(POLL_INTERVAL):
             if not running:
                 break

@@ -17,14 +17,24 @@ services:
       # SABNZBD_API_KEY: "your-sab-key"
       # Disk I/O (optional)
       # DISK_DEVICES: "sda,nvme0n1"
+      # Notifications (optional)
+      # DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."
+      # WEBHOOK_URL: "https://your-webhook-endpoint/..."
       # Behavior
       POLL_INTERVAL: "30"
       STUCK_SCAN_TIMEOUT: "7200"
       DRY_RUN: "true"
       TZ: "America/New_York"
+    ports:
+      - "8095:8095"
     # volumes:
     #   - /proc/diskstats:/host/proc/diskstats:ro
     mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8095/health')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
     logging:
       driver: json-file
       options:
