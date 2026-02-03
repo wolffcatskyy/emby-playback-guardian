@@ -76,27 +76,33 @@ All configuration is via environment variables.
 | `DISK_PROC_PATH` | Path to diskstats (use `/host/proc/diskstats` in Docker) | `/host/proc/diskstats` |
 | `DISK_SAMPLE_SECONDS` | Seconds to sample disk I/O per cycle | `2` |
 
-## Docker Compose Example
+## Quick Start
 
 ```yaml
 services:
-  emby-guardian:
-    image: python:3.11-slim
-    container_name: emby-guardian
+  emby-playback-guardian:
+    image: ghcr.io/wolffcatskyy/emby-playback-guardian:latest
+    container_name: emby-playback-guardian
     restart: unless-stopped
-    command: pip install requests && python /app/guardian.py
-    volumes:
-      - ./guardian.py:/app/guardian.py:ro
-      - /proc:/host/proc:ro
     environment:
-      - EMBY_URL=http://emby:8096
-      - EMBY_API_KEY=your_api_key_here
-      - QBIT_URL=http://qbittorrent:8080
-      - QBIT_USERNAME=admin
-      - QBIT_PASSWORD=your_password
-      - DISK_DEVICES=sda
-      - STUCK_STALL_MINUTES=15
+      EMBY_URL: "http://emby:8096"
+      EMBY_API_KEY: "your-api-key"
+      SERVER_TYPE: "emby"
+      # qBittorrent (optional)
+      # QBIT_URL: "http://qbittorrent:8080"
+      # QBIT_USERNAME: "admin"
+      # QBIT_PASSWORD: "your-password"
+      # Disk I/O (optional — mount /proc below)
+      # DISK_DEVICES: "sda"
+      DRY_RUN: "true"
+      TZ: "America/New_York"
+    # Uncomment for disk I/O monitoring:
+    # volumes:
+    #   - /proc/diskstats:/host/proc/diskstats:ro
+    mem_limit: 64m
 ```
+
+Start with `DRY_RUN=true` to verify it detects your playback sessions, then set to `false`.
 
 ## How Stuck Detection Works
 
