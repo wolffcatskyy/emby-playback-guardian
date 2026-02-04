@@ -16,6 +16,9 @@ Protects Emby/Jellyfin playback by automatically pausing library tasks and throt
 - **Stuck Task Detection** — Kills tasks that stall (no progress change) or exceed absolute timeout
 - **Download Throttling** — Throttles qBittorrent/SABnzbd when playback is active or disk I/O is saturated
 - **Auto-Restore** — Restores normal operation when playback ends and system load normalizes
+- **Notifications** — Discord and generic webhook notifications for key events
+- **Health & Metrics** — Built-in `/health` and `/metrics` endpoints for monitoring and Prometheus scraping
+- **Startup Resilience** — Retries connecting to Emby/Jellyfin on startup instead of exiting immediately
 
 ## Configuration
 
@@ -70,6 +73,29 @@ All configuration is via environment variables.
 | `DISK_PROC_PATH` | Path to diskstats (use `/host/proc/diskstats` in Docker) | `/host/proc/diskstats` |
 | `DISK_SAMPLE_SECONDS` | Seconds to sample disk I/O per cycle | `2` |
 
+### Retry Behavior (optional)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MAX_RETRIES` | Maximum number of retries for failed HTTP requests (connection errors, timeouts, HTTP 429/5xx) | `3` |
+| `RETRY_BACKOFF` | Exponential backoff multiplier between retries (delay = base * backoff^attempt) | `2` |
+| `RETRY_BASE_DELAY` | Base delay in seconds between retries | `1` |
+| `STARTUP_RETRIES` | Number of attempts to connect to the media server on startup before exiting | `10` |
+| `STARTUP_RETRY_DELAY` | Seconds to wait between startup connection attempts | `30` |
+
+### Health & Metrics (optional)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HEALTH_PORT` | Port for the health check and metrics HTTP server (set to `0` to disable) | `8095` |
+
+### Notifications (optional)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DISCORD_WEBHOOK_URL` | Discord webhook URL for event notifications (uses embeds with color-coded severity) | _(empty)_ |
+| `WEBHOOK_URL` | Generic webhook URL — receives JSON `POST` with `event`, `message`, `level`, `source`, and `timestamp` fields | _(empty)_ |
+
 ## Quick Start
 
 ```yaml
@@ -86,10 +112,15 @@ services:
       # QBIT_URL: "http://qbittorrent:8080"
       # QBIT_USERNAME: "admin"
       # QBIT_PASSWORD: "your-password"
+      # Notifications (optional)
+      # DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/..."
+      # WEBHOOK_URL: "https://your-webhook-endpoint/..."
       # Disk I/O (optional — mount /proc below)
       # DISK_DEVICES: "sda"
       DRY_RUN: "true"
       TZ: "America/New_York"
+    ports:
+      - "8095:8095"
     # Uncomment for disk I/O monitoring:
     # volumes:
     #   - /proc/diskstats:/host/proc/diskstats:ro
@@ -107,6 +138,114 @@ The guardian uses a two-layer approach to detect stuck tasks:
 2. **Absolute timeout (fallback):** If a task has been running longer than `STUCK_SCAN_TIMEOUT` seconds (default: 2 hours), it is killed regardless of progress. This catches edge cases where progress reporting is broken.
 
 Set `STUCK_STALL_MINUTES=0` to disable progress-based detection and rely only on the absolute timeout.
+
+## Startup Retry
+
+When the container starts, it attempts to connect to the Emby/Jellyfin server before entering the main loop. If the server is not yet available (e.g. during a host reboot where containers start in parallel), the guardian will retry instead of exiting immediately.
+
+- Retries up to `STARTUP_RETRIES` times (default: 10)
+- Waits `STARTUP_RETRY_DELAY` seconds between attempts (default: 30)
+- With defaults, the guardian will wait up to ~5 minutes for the media server to become available
+- If all retries are exhausted, the container exits with an error
+
+This is useful when using `depends_on` without health checks, or when the media server takes a long time to initialize.
+
+## API Retry & Backoff
+
+All HTTP requests to Emby, qBittorrent, and SABnzbd are wrapped with automatic retry logic using exponential backoff. This prevents transient network issues or brief server hiccups from causing missed poll cycles.
+
+- Retries on: `ConnectionError`, `Timeout`, HTTP `429`, HTTP `5xx`
+- Does **not** retry on: HTTP `4xx` (except `429`)
+- Delay formula: `RETRY_BASE_DELAY * (RETRY_BACKOFF ^ attempt)` — with defaults this is 1s, 2s, 4s
+- Controlled by `MAX_RETRIES` (default: 3), `RETRY_BACKOFF` (default: 2), `RETRY_BASE_DELAY` (default: 1)
+
+## Health & Metrics Endpoints
+
+The guardian runs a lightweight HTTP server (default port `8095`) with two endpoints. Set `HEALTH_PORT=0` to disable.
+
+### `GET /health`
+
+Returns JSON with HTTP `200` (healthy) or `503` (unhealthy). The guardian is considered healthy when Emby is connected and a successful poll cycle completed within `POLL_INTERVAL * 3` seconds.
+
+```json
+{
+  "status": "healthy",
+  "last_successful_cycle_ago_seconds": 12.3,
+  "emby_connected": true,
+  "downloads_throttled": false,
+  "tasks_paused": 0,
+  "stuck_kills_total": 0,
+  "version": "1.2.0"
+}
+```
+
+Use this with Docker's `HEALTHCHECK` (already configured in the image) or an external monitoring system.
+
+### `GET /metrics`
+
+Returns metrics in Prometheus text exposition format for scraping. Available metrics:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `guardian_poll_cycles_total` | counter | Total poll cycles executed |
+| `guardian_poll_errors_total` | counter | Total poll cycle errors |
+| `guardian_tasks_paused_total` | counter | Total tasks paused since startup |
+| `guardian_stuck_kills_total` | counter | Total stuck tasks killed since startup |
+| `guardian_playback_active` | gauge | Whether playback is currently active (0/1) |
+| `guardian_downloads_throttled` | gauge | Whether downloads are currently throttled (0/1) |
+| `guardian_tasks_paused_current` | gauge | Tasks currently paused by guardian |
+| `guardian_tasks_running_current` | gauge | Tasks currently running on server |
+| `guardian_disk_io_percent` | gauge | Current disk I/O utilization percentage |
+| `guardian_last_cycle_duration_seconds` | gauge | Duration of the last poll cycle |
+| `guardian_info` | gauge | Version info label |
+
+Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: emby-guardian
+    static_configs:
+      - targets: ["emby-playback-guardian:8095"]
+```
+
+## Notifications
+
+The guardian can send real-time notifications for key events via Discord webhooks and/or a generic JSON webhook. Configure either or both by setting the corresponding environment variable.
+
+### Events
+
+| Event | Level | When |
+|-------|-------|------|
+| Task Paused | info | A library task is paused because playback is active |
+| Stuck Task Killed | warning | A stuck/stalled task is killed |
+| Downloads Throttled | info | Downloads are throttled due to playback or disk I/O |
+| Downloads Restored | info | Downloads are restored after conditions normalize |
+
+### Discord
+
+Set `DISCORD_WEBHOOK_URL` to a Discord webhook URL. Notifications are sent as embeds with color-coded severity:
+
+- **Blue** (info) — task paused, downloads throttled/restored
+- **Yellow** (warning) — stuck task killed
+- **Red** (error) — reserved for future use
+
+### Generic Webhook
+
+Set `WEBHOOK_URL` to any HTTP endpoint. The guardian sends a JSON `POST` with this payload:
+
+```json
+{
+  "event": "Stuck Task Killed",
+  "message": "Killed 'Scan media library' -- progress stalled at 45% for 15min",
+  "level": "warning",
+  "source": "emby-playback-guardian",
+  "timestamp": "2025-01-15T12:34:56+00:00"
+}
+```
+
+This works with services like ntfy, Gotify, Home Assistant webhooks, or any custom receiver.
+
+In dry-run mode, notification messages are prefixed with `[DRY RUN]` so you can verify the integration without taking real actions.
 
 ## Contributing
 
