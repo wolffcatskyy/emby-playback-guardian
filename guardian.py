@@ -106,11 +106,21 @@ THROTTLE_HOOK_TIMEOUT = env_int("THROTTLE_HOOK_TIMEOUT", 30)
 
 
 def _discover_hooks(prefix):
-    """Find all env vars with given prefix, sorted by key name."""
+    """Find all env vars with given prefix, sorted numerically by suffix."""
     hooks = []
-    for key, value in sorted(os.environ.items()):
+    for key, value in os.environ.items():
         if key.startswith(prefix) and value.strip():
             hooks.append((key, value.strip()))
+
+    def _sort_key(item):
+        """Sort numerically by trailing number (e.g. _2 before _10)."""
+        suffix = item[0][len(prefix):]
+        try:
+            return (0, int(suffix))
+        except ValueError:
+            return (1, suffix)
+
+    hooks.sort(key=_sort_key)
     return hooks
 
 
@@ -552,13 +562,16 @@ class ThrottleHookRunner:
                 if result.stdout.strip():
                     log.debug(f"  Hook {env_key} stdout: "
                               f"{result.stdout.strip()}")
-                if result.stderr.strip():
-                    log.debug(f"  Hook {env_key} stderr: "
-                              f"{result.stderr.strip()}")
                 if result.returncode != 0:
+                    if result.stderr.strip():
+                        log.warning(f"  Hook {env_key} stderr: "
+                                    f"{result.stderr.strip()}")
                     log.warning(f"Hook {env_key} exited with code "
                                 f"{result.returncode}")
                 else:
+                    if result.stderr.strip():
+                        log.debug(f"  Hook {env_key} stderr: "
+                                  f"{result.stderr.strip()}")
                     log.info(f"Hook {env_key} completed successfully")
             except subprocess.TimeoutExpired:
                 log.error(f"Hook {env_key} timed out after "
@@ -814,8 +827,9 @@ def main():
             THROTTLE_HOOKS_ON, THROTTLE_HOOKS_OFF,
             THROTTLE_HOOK_TIMEOUT, DRY_RUN
         )
-        log.info(f"Throttle hooks: {len(THROTTLE_HOOKS_ON)} ON, "
-                 f"{len(THROTTLE_HOOKS_OFF)} OFF "
+        on_names = ", ".join(k for k, _ in THROTTLE_HOOKS_ON) or "none"
+        off_names = ", ".join(k for k, _ in THROTTLE_HOOKS_OFF) or "none"
+        log.info(f"Throttle hooks: ON=[{on_names}], OFF=[{off_names}] "
                  f"(timeout: {THROTTLE_HOOK_TIMEOUT}s)")
     else:
         log.info("Throttle hooks: not configured (skipping)")
