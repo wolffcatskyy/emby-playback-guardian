@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -99,6 +100,22 @@ HEALTH_PORT = env_int("HEALTH_PORT", 8095)
 # Notifications (optional)
 DISCORD_WEBHOOK_URL = env("DISCORD_WEBHOOK_URL", "")
 WEBHOOK_URL = env("WEBHOOK_URL", "")
+
+# Custom throttle hooks (optional)
+THROTTLE_HOOK_TIMEOUT = env_int("THROTTLE_HOOK_TIMEOUT", 30)
+
+
+def _discover_hooks(prefix):
+    """Find all env vars with given prefix, sorted by key name."""
+    hooks = []
+    for key, value in sorted(os.environ.items()):
+        if key.startswith(prefix) and value.strip():
+            hooks.append((key, value.strip()))
+    return hooks
+
+
+THROTTLE_HOOKS_ON = _discover_hooks("THROTTLE_HOOK_ON_")
+THROTTLE_HOOKS_OFF = _discover_hooks("THROTTLE_HOOK_OFF_")
 
 
 # --- Logging ---------------------------------------------------------------------
@@ -499,6 +516,59 @@ class SABnzbdClient:
 
 # --- Notification Client ---------------------------------------------------------
 
+class ThrottleHookRunner:
+    """Executes user-defined shell commands on throttle state transitions."""
+
+    def __init__(self, hooks_on, hooks_off, timeout=30, dry_run=False):
+        self.hooks_on = hooks_on
+        self.hooks_off = hooks_off
+        self.timeout = timeout
+        self.dry_run = dry_run
+
+    @property
+    def enabled(self):
+        return bool(self.hooks_on or self.hooks_off)
+
+    def run_on_hooks(self):
+        """Execute all THROTTLE_HOOK_ON_* commands."""
+        self._run_hooks(self.hooks_on, "ON")
+
+    def run_off_hooks(self):
+        """Execute all THROTTLE_HOOK_OFF_* commands."""
+        self._run_hooks(self.hooks_off, "OFF")
+
+    def _run_hooks(self, hooks, label):
+        for env_key, cmd in hooks:
+            if self.dry_run:
+                log.info(f"[DRY RUN] Would execute throttle hook "
+                         f"{label} ({env_key}): {cmd}")
+                continue
+            try:
+                log.info(f"Executing throttle hook {label} ({env_key}): {cmd}")
+                result = subprocess.run(
+                    cmd, shell=True, timeout=self.timeout,
+                    capture_output=True, text=True
+                )
+                if result.stdout.strip():
+                    log.debug(f"  Hook {env_key} stdout: "
+                              f"{result.stdout.strip()}")
+                if result.stderr.strip():
+                    log.debug(f"  Hook {env_key} stderr: "
+                              f"{result.stderr.strip()}")
+                if result.returncode != 0:
+                    log.warning(f"Hook {env_key} exited with code "
+                                f"{result.returncode}")
+                else:
+                    log.info(f"Hook {env_key} completed successfully")
+            except subprocess.TimeoutExpired:
+                log.error(f"Hook {env_key} timed out after "
+                          f"{self.timeout}s")
+            except Exception as e:
+                log.error(f"Hook {env_key} failed: {e}")
+
+
+# --- Notification Client (moved after hooks) ---------------------------------
+
 class NotificationClient:
     """Sends notifications via Discord webhook and/or generic webhook."""
 
@@ -738,6 +808,18 @@ def main():
     else:
         log.info("Notifications: not configured (skipping)")
 
+    hooks = None
+    if THROTTLE_HOOKS_ON or THROTTLE_HOOKS_OFF:
+        hooks = ThrottleHookRunner(
+            THROTTLE_HOOKS_ON, THROTTLE_HOOKS_OFF,
+            THROTTLE_HOOK_TIMEOUT, DRY_RUN
+        )
+        log.info(f"Throttle hooks: {len(THROTTLE_HOOKS_ON)} ON, "
+                 f"{len(THROTTLE_HOOKS_OFF)} OFF "
+                 f"(timeout: {THROTTLE_HOOK_TIMEOUT}s)")
+    else:
+        log.info("Throttle hooks: not configured (skipping)")
+
     log.info(f"Poll interval: {POLL_INTERVAL}s | "
              f"Stuck timeout: {STUCK_SCAN_TIMEOUT}s | "
              f"Stall detection: {STUCK_STALL_MINUTES}min | "
@@ -893,6 +975,9 @@ def main():
                         log.info(f"[DRY RUN] Would set SABnzbd to "
                                  f"{SABNZBD_THROTTLE_PCT}%")
 
+                if hooks:
+                    hooks.run_on_hooks()
+
                 state.downloads_throttled = True
                 state.throttle_reason = reason
                 if notifier:
@@ -924,6 +1009,9 @@ def main():
                     else:
                         log.info(f"[DRY RUN] Would restore SABnzbd to "
                                  f"{state.sab_original_speed}%")
+
+                if hooks:
+                    hooks.run_off_hooks()
 
                 if notifier:
                     notifier.notify("Downloads Restored",
