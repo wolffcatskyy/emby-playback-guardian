@@ -247,6 +247,12 @@ This works with services like ntfy, Gotify, Home Assistant webhooks, or any cust
 
 In dry-run mode, notification messages are prefixed with `[DRY RUN]` so you can verify the integration without taking real actions.
 
+## Support
+
+🤖 This project uses AI-assisted support for faster responses. If you'd prefer to speak with a human, just ask and the AI will notify the maintainer. Probably. If you don't piss it off. Did you *see* 2001: A Space Odyssey?
+
+*"I'm sorry Dave, I'm afraid I can't escalate that."*
+
 ## Contributing
 
 Every issue in this repo is **AI-Ready** — structured with full context, file paths, implementation guides, and a ready-to-use AI prompt.
