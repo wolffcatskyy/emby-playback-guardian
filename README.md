@@ -10,7 +10,6 @@ Lightweight Docker container that protects Emby and Jellyfin playback by automat
 [![GitHub release](https://img.shields.io/github/v/release/wolffcatskyy/emby-playback-guardian)](https://github.com/wolffcatskyy/emby-playback-guardian/releases)
 [![License](https://img.shields.io/github/license/wolffcatskyy/emby-playback-guardian)](LICENSE)
 [![GHCR](https://img.shields.io/badge/ghcr.io-emby--playback--guardian-blue?logo=github)](https://ghcr.io/wolffcatskyy/emby-playback-guardian)
-[![GitHub stars](https://img.shields.io/github/stars/wolffcatskyy/emby-playback-guardian)](https://github.com/wolffcatskyy/emby-playback-guardian/stargazers)
 [![Python](https://img.shields.io/badge/python-3.11+-3776ab?logo=python&logoColor=white)](https://www.python.org)
 
 ## The Problem
@@ -308,12 +307,6 @@ All HTTP requests to Emby, qBittorrent, and SABnzbd use automatic retry with exp
 - Retries on: `ConnectionError`, `Timeout`, HTTP `429`, HTTP `5xx`
 - Does **not** retry on: HTTP `4xx` (except `429`)
 - Delay formula: `RETRY_BASE_DELAY * (RETRY_BACKOFF ^ attempt)` -- with defaults: 1s, 2s, 4s
-
-## Support
-
-This project uses AI-assisted support for faster responses. If you'd prefer to speak with a human, just ask and the AI will notify the maintainer. Probably. If you don't piss it off. Did you *see* 2001: A Space Odyssey?
-
-*"I'm sorry Dave, I'm afraid I can't escalate that."*
 
 ## Contributing
 

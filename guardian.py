@@ -28,8 +28,6 @@ import requests
 __version__ = "1.2.0"
 
 
-# --- Configuration ---------------------------------------------------------------
-
 def env(key, default=None):
     """Get environment variable, stripping whitespace."""
     val = os.environ.get(key, default)
@@ -37,13 +35,11 @@ def env(key, default=None):
 
 
 def env_bool(key, default=False):
-    """Get boolean environment variable."""
     val = env(key, str(default)).lower()
     return val in ("true", "1", "yes")
 
 
 def env_int(key, default=0):
-    """Get integer environment variable."""
     try:
         return int(env(key, str(default)))
     except (ValueError, TypeError):
@@ -106,14 +102,12 @@ THROTTLE_HOOK_TIMEOUT = env_int("THROTTLE_HOOK_TIMEOUT", 30)
 
 
 def _discover_hooks(prefix):
-    """Find all env vars with given prefix, sorted numerically by suffix."""
     hooks = []
     for key, value in os.environ.items():
         if key.startswith(prefix) and value.strip():
             hooks.append((key, value.strip()))
 
     def _sort_key(item):
-        """Sort numerically by trailing number (e.g. _2 before _10)."""
         suffix = item[0][len(prefix):]
         try:
             return (0, int(suffix))
@@ -128,10 +122,7 @@ THROTTLE_HOOKS_ON = _discover_hooks("THROTTLE_HOOK_ON_")
 THROTTLE_HOOKS_OFF = _discover_hooks("THROTTLE_HOOK_OFF_")
 
 
-# --- Logging ---------------------------------------------------------------------
-
 def setup_logging():
-    """Configure structured logging."""
     level = getattr(logging, LOG_LEVEL, logging.INFO)
     fmt = "[%(asctime)s] [%(levelname)s] %(message)s"
     logging.basicConfig(level=level, format=fmt, datefmt="%Y-%m-%d %H:%M:%S",
@@ -141,8 +132,6 @@ def setup_logging():
 
 log = setup_logging()
 
-
-# --- Retry Helper ----------------------------------------------------------------
 
 def retry_request(func, *args, max_retries=None, **kwargs):
     """Execute an HTTP request function with exponential backoff retry.
@@ -182,11 +171,8 @@ def retry_request(func, *args, max_retries=None, **kwargs):
     return resp
 
 
-# --- Data Types ------------------------------------------------------------------
-
 @dataclass
 class TaskInfo:
-    """Represents an Emby scheduled task."""
     id: str
     name: str
     state: str
@@ -248,7 +234,6 @@ class GuardianState:
 
 @dataclass
 class MetricsCollector:
-    """Collects Prometheus-compatible metrics from guardian state."""
     poll_cycles_total: int = 0
     poll_errors_total: int = 0
     tasks_paused_total: int = 0
@@ -261,7 +246,6 @@ class MetricsCollector:
     disk_io_percent: float = 0.0
 
     def to_prometheus(self):
-        """Render metrics in Prometheus text exposition format."""
         lines = []
 
         def metric(name, help_text, mtype, value):
@@ -306,8 +290,6 @@ class MetricsCollector:
         return "\n".join(lines) + "\n"
 
 
-# --- Emby/Jellyfin Client -------------------------------------------------------
-
 class EmbyClient:
     """Emby/Jellyfin REST API client for sessions and task management."""
 
@@ -338,7 +320,6 @@ class EmbyClient:
         return resp
 
     def get_active_sessions(self):
-        """Return list of sessions with active playback."""
         sessions = self._get("/Sessions")
         active = []
         for s in sessions:
@@ -355,7 +336,6 @@ class EmbyClient:
         return active
 
     def has_active_playback(self):
-        """Check if anyone is currently playing media."""
         sessions = self.get_active_sessions()
         if sessions:
             for s in sessions:
@@ -364,11 +344,9 @@ class EmbyClient:
         return len(sessions) > 0
 
     def get_scheduled_tasks(self):
-        """Return all scheduled tasks."""
         return self._get("/ScheduledTasks")
 
     def get_running_tasks(self, state_tracker):
-        """Return list of TaskInfo for currently running tasks."""
         tasks = self.get_scheduled_tasks()
         running = []
         now = time.time()
@@ -396,11 +374,9 @@ class EmbyClient:
         return running
 
     def stop_task(self, task_id):
-        """Stop a running scheduled task."""
         self._delete(f"/ScheduledTasks/Running/{task_id}")
 
     def test_connection(self):
-        """Verify API connectivity."""
         try:
             info = self._get("/System/Info/Public")
             name = info.get("ServerName", "Unknown")
@@ -413,8 +389,6 @@ class EmbyClient:
                       f"at {self.base}: {e}")
             return False
 
-
-# --- qBittorrent Client ----------------------------------------------------------
 
 class QBitClient:
     """qBittorrent Web API client with session cookie management."""
@@ -486,8 +460,6 @@ class QBitClient:
             return False
 
 
-# --- SABnzbd Client --------------------------------------------------------------
-
 class SABnzbdClient:
     """SABnzbd API client (stateless, uses apikey in query params)."""
 
@@ -524,10 +496,7 @@ class SABnzbdClient:
             return False
 
 
-# --- Notification Client ---------------------------------------------------------
-
 class ThrottleHookRunner:
-    """Executes user-defined shell commands on throttle state transitions."""
 
     def __init__(self, hooks_on, hooks_off, timeout=30, dry_run=False):
         self.hooks_on = hooks_on
@@ -540,11 +509,9 @@ class ThrottleHookRunner:
         return bool(self.hooks_on or self.hooks_off)
 
     def run_on_hooks(self):
-        """Execute all THROTTLE_HOOK_ON_* commands."""
         self._run_hooks(self.hooks_on, "ON")
 
     def run_off_hooks(self):
-        """Execute all THROTTLE_HOOK_OFF_* commands."""
         self._run_hooks(self.hooks_off, "OFF")
 
     def _run_hooks(self, hooks, label):
@@ -580,8 +547,6 @@ class ThrottleHookRunner:
                 log.error(f"Hook {env_key} failed: {e}")
 
 
-# --- Notification Client (moved after hooks) ---------------------------------
-
 class NotificationClient:
     """Sends notifications via Discord webhook and/or generic webhook."""
 
@@ -606,7 +571,6 @@ class NotificationClient:
             self._send_webhook(event, full_message, level)
 
     def _send_discord(self, event, message, level):
-        """Post to Discord webhook using embeds."""
         colors = {"info": 3447003, "warning": 16776960, "error": 15158332}
         payload = {
             "embeds": [{
@@ -623,7 +587,6 @@ class NotificationClient:
             log.warning(f"Discord notification failed: {e}")
 
     def _send_webhook(self, event, message, level):
-        """POST JSON to generic webhook URL."""
         payload = {
             "event": event,
             "message": message,
@@ -637,8 +600,6 @@ class NotificationClient:
         except Exception as e:
             log.warning(f"Webhook notification failed: {e}")
 
-
-# --- Disk I/O Monitor ------------------------------------------------------------
 
 class DiskMonitor:
     """Parse /proc/diskstats to calculate disk busy percentage."""
@@ -695,8 +656,6 @@ class DiskMonitor:
             return False
 
 
-# --- Health Check & Metrics Server -----------------------------------------------
-
 class HealthMetricsHandler(BaseHTTPRequestHandler):
     """Serves /health as JSON and /metrics in Prometheus text format."""
     state = None
@@ -745,7 +704,6 @@ class HealthMetricsHandler(BaseHTTPRequestHandler):
 
 
 def start_health_metrics_server(port, state, metrics):
-    """Start health check and metrics HTTP server in a daemon thread."""
     HealthMetricsHandler.state = state
     HealthMetricsHandler.metrics = metrics
     server = HTTPServer(("0.0.0.0", port), HealthMetricsHandler)
@@ -756,14 +714,10 @@ def start_health_metrics_server(port, state, metrics):
     return server
 
 
-# --- Task Matching ---------------------------------------------------------------
-
 def is_pausable_task(task_name):
     name_lower = task_name.lower()
     return any(p.lower() in name_lower for p in PAUSABLE_TASKS)
 
-
-# --- Main Loop -------------------------------------------------------------------
 
 def main():
     log.info(f"Emby Playback Guardian v{__version__}")
