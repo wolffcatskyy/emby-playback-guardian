@@ -82,7 +82,8 @@ LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 PAUSABLE_TASKS = [t.strip() for t in env(
     "PAUSABLE_TASKS",
     "Scan media library,Refresh Guide,Download subtitles,"
-    "Video preview thumbnail extraction,Scan Metadata Folder"
+    "Video preview thumbnail extraction,Scan Metadata Folder,"
+    "Scan for episode intros"
 ).split(",") if t.strip()]
 
 # Retry behavior
