@@ -14,6 +14,7 @@ https://github.com/wolffcatskyy/emby-playback-guardian
 import json
 import logging
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -25,7 +26,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 
-__version__ = "1.2.0"
+# psutil is optional -- required for disk I/O monitoring on Windows/macOS,
+# not needed on Linux (which reads /proc/diskstats directly).
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+__version__ = "1.3.0"
 
 
 # --- Configuration ---------------------------------------------------------------
@@ -642,15 +651,62 @@ class NotificationClient:
 # --- Disk I/O Monitor ------------------------------------------------------------
 
 class DiskMonitor:
-    """Parse /proc/diskstats to calculate disk busy percentage."""
+    """Cross-platform disk I/O utilization monitor.
+
+    Supports three backends, auto-selected by platform:
+      - "procfs"  (Linux): reads /proc/diskstats directly -- zero extra deps
+      - "psutil"  (Windows/macOS): uses psutil.disk_io_counters(perdisk=True)
+      - None      (unsupported): logs a warning, returns 0% utilization
+
+    On Windows, psutil device names are like "PhysicalDrive0" or "C:".
+    On macOS, names are like "disk0", "disk1".
+    Configure DISK_DEVICES with the appropriate names for your platform.
+
+    Windows utilization calculation:
+      psutil does not expose a single "busy_time" counter on Windows.
+      Instead we sum read_time + write_time (both in milliseconds) and
+      compute: delta_ms / interval_ms * 100.  This can exceed 100% on
+      multi-queue NVMe drives, so we cap at 100%.
+    """
+
+    BACKEND_PROCFS = "procfs"
+    BACKEND_PSUTIL = "psutil"
 
     def __init__(self, devices, proc_path="/host/proc/diskstats",
                  sample_seconds=2):
         self.devices = devices
         self.proc_path = proc_path
         self.sample_seconds = sample_seconds
+        self._backend = self._detect_backend()
 
-    def _read_io_ticks(self):
+    def _detect_backend(self):
+        """Choose the best I/O backend for the current platform."""
+        system = platform.system()
+
+        if system == "Linux":
+            # Prefer native /proc/diskstats -- no extra dependency needed
+            return self.BACKEND_PROCFS
+
+        if system in ("Windows", "Darwin"):
+            if _HAS_PSUTIL:
+                return self.BACKEND_PSUTIL
+            log.warning(
+                f"Disk monitoring on {system} requires psutil, but it is "
+                "not installed. Install with: pip install psutil"
+            )
+            return None
+
+        # Unknown platform
+        log.warning(
+            f"Disk monitoring is not supported on platform '{system}' "
+            "-- disk I/O checks will be skipped"
+        )
+        return None
+
+    # -- Backend: /proc/diskstats (Linux) ----------------------------------
+
+    def _read_io_linux(self):
+        """Read io_ticks (field 13) from /proc/diskstats for each device."""
         result = {}
         try:
             with open(self.proc_path, "r") as f:
@@ -667,12 +723,50 @@ class DiskMonitor:
             log.warning(f"Error reading disk stats: {e}")
         return result
 
+    # -- Backend: psutil (Windows / macOS) ---------------------------------
+
+    def _read_io_psutil(self):
+        """Read cumulative I/O time (ms) from psutil for each device.
+
+        Returns dict of {device_name: busy_time_ms}.
+        On Windows, psutil has no dedicated busy_time field, so we
+        approximate by summing read_time + write_time (both in ms).
+        On macOS / Linux-via-psutil, the same approach works.
+        """
+        result = {}
+        try:
+            counters = psutil.disk_io_counters(perdisk=True)
+            for dev_name in self.devices:
+                if dev_name in counters:
+                    c = counters[dev_name]
+                    # read_time + write_time gives total ms the disk was busy.
+                    # This can double-count on parallel queues, which is why
+                    # we cap utilization at 100% in get_utilization().
+                    result[dev_name] = c.read_time + c.write_time
+        except Exception as e:
+            log.warning(f"Error reading disk stats via psutil: {e}")
+        return result
+
+    # -- Dispatcher --------------------------------------------------------
+
+    def _read_io(self):
+        """Read I/O ticks using the platform-appropriate backend."""
+        if self._backend == self.BACKEND_PROCFS:
+            return self._read_io_linux()
+        elif self._backend == self.BACKEND_PSUTIL:
+            return self._read_io_psutil()
+        return {}
+
     def get_utilization(self):
-        before = self._read_io_ticks()
+        """Sample disk I/O over self.sample_seconds, return max busy %."""
+        if self._backend is None:
+            return 0.0
+
+        before = self._read_io()
         if not before:
             return 0.0
         time.sleep(self.sample_seconds)
-        after = self._read_io_ticks()
+        after = self._read_io()
         interval_ms = self.sample_seconds * 1000
         max_busy = 0.0
         for dev in self.devices:
@@ -685,14 +779,22 @@ class DiskMonitor:
         return max_busy
 
     def test(self):
-        ticks = self._read_io_ticks()
+        """Verify that configured devices are visible to the chosen backend."""
+        if self._backend is None:
+            log.warning("Disk monitoring: no supported backend available")
+            return False
+
+        log.info(f"Disk monitoring: using '{self._backend}' backend "
+                 f"on {platform.system()}")
+        ticks = self._read_io()
         if ticks:
             log.info(f"Disk monitoring: {len(ticks)} device(s) found "
                      f"({', '.join(ticks.keys())})")
             return True
         else:
-            log.warning("Disk monitoring: no configured devices found "
-                        f"in {self.proc_path}")
+            log.warning("Disk monitoring: no configured devices found"
+                        f" (backend={self._backend}, "
+                        f"devices={self.devices})")
             return False
 
 
