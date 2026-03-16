@@ -27,12 +27,12 @@ Download clients make it worse. SABnzbd and qBittorrent saturate disk throughput
 - **Stuck Task Detection** -- Kills tasks that stall (no progress change) or exceed absolute timeout
 - **Download Throttling** -- Throttles qBittorrent and SABnzbd when playback is active or disk I/O is saturated
 - **Auto-Restore** -- Restores normal operation when playback ends and system load normalizes
-- **Disk I/O Monitoring** -- Monitors `/proc/diskstats` to detect I/O saturation independent of playback
+- **Disk I/O Monitoring** -- Cross-platform disk I/O monitoring (Linux via `/proc/diskstats`, Windows/macOS via `psutil`)
 - **Notifications** -- Discord and generic webhook notifications for key events
 - **Health & Metrics** -- Built-in `/health` and `/metrics` endpoints for Prometheus scraping
 - **Startup Resilience** -- Retries connecting to Emby/Jellyfin on startup instead of exiting immediately
 - **Dry Run Mode** -- Test the full pipeline without taking any real actions
-- **64 MB footprint** -- Single Python process, no database, no dependencies beyond `requests`
+- **64 MB footprint** -- Single Python process, no database, minimal dependencies (`requests` + `psutil`)
 
 ## Quick Start
 
@@ -75,6 +75,16 @@ services:
 
 ### Adding Disk I/O Monitoring
 
+Disk I/O monitoring works cross-platform. The backend is auto-detected:
+
+| Platform | Backend | Device name examples |
+|----------|---------|---------------------|
+| Linux | `/proc/diskstats` (native, zero extra deps) | `sda`, `sdb`, `nvme0n1` |
+| Windows | `psutil` | `PhysicalDrive0`, `PhysicalDrive1`, `C:`, `D:` |
+| macOS | `psutil` | `disk0`, `disk1` |
+
+**Linux (Docker):**
+
 ```yaml
     environment:
       # ... base config above ...
@@ -82,6 +92,20 @@ services:
       IO_THRESHOLD: "80"                 # throttle when disk is 80%+ busy
     volumes:
       - /proc/diskstats:/host/proc/diskstats:ro
+```
+
+**Windows (native Python):**
+
+```yaml
+    environment:
+      DISK_DEVICES: "PhysicalDrive0"     # or "C:" -- check device names with psutil
+      IO_THRESHOLD: "80"
+```
+
+To discover available device names on Windows, run:
+```python
+import psutil
+print(list(psutil.disk_io_counters(perdisk=True).keys()))
 ```
 
 ### Adding Notifications
@@ -102,7 +126,7 @@ services:
          +----------+----------+
          |                     |
    Check Emby API        Check disk I/O
-   for active sessions   via /proc/diskstats
+   for active sessions   (procfs or psutil)
          |                     |
          v                     v
    Playback active?      I/O > threshold?
@@ -179,7 +203,7 @@ All configuration is via environment variables. Only `EMBY_URL` and `EMBY_API_KE
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DISK_DEVICES` | Comma-separated device names from `/proc/diskstats` (e.g. `sda,sdb`) | _(empty)_ |
+| `DISK_DEVICES` | Comma-separated device names (Linux: `sda,sdb`, Windows: `PhysicalDrive0`, macOS: `disk0`) | _(empty)_ |
 | `DISK_PROC_PATH` | Path to diskstats (use `/host/proc/diskstats` in Docker) | `/host/proc/diskstats` |
 | `DISK_SAMPLE_SECONDS` | Seconds to sample disk I/O per cycle | `2` |
 

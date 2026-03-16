@@ -8,7 +8,11 @@ LABEL org.opencontainers.image.licenses="MIT"
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# gcc, musl-dev, linux-headers are needed to compile psutil on Alpine.
+# They are removed after pip install to keep the final image small.
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev linux-headers \
+    && pip install --no-cache-dir -r requirements.txt \
+    && apk del .build-deps
 
 COPY guardian.py .
 
