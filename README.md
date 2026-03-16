@@ -1,5 +1,8 @@
 # Emby Playback Guardian
 
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/wolffcatskyy?label=Sponsor&logo=github&color=ea4aaa)](https://github.com/sponsors/wolffcatskyy)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/wolffcatskyy)
+
 ---
 **Note:** This project was developed with and is supported by AI. Issues and PRs are triaged and responded to by AI agents. If you need a human just ask, but honestly AI is faster, smarter, and nicer.
 
