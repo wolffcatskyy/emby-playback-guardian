@@ -34,7 +34,7 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 
 # --- Configuration ---------------------------------------------------------------
@@ -78,6 +78,7 @@ SABNZBD_THROTTLE_PCT = env_int("SABNZBD_THROTTLE_PCT", 50)
 DISK_DEVICES = [d.strip() for d in env("DISK_DEVICES", "").split(",") if d.strip()]
 DISK_PROC_PATH = env("DISK_PROC_PATH", "/host/proc/diskstats")
 DISK_SAMPLE_SECONDS = env_int("DISK_SAMPLE_SECONDS", 2)
+DISK_MAX_THROUGHPUT_MB = env_int("DISK_MAX_THROUGHPUT_MB", 200)
 
 # Behavior
 POLL_INTERVAL = env_int("POLL_INTERVAL", 30)
@@ -663,21 +664,25 @@ class DiskMonitor:
     Configure DISK_DEVICES with the appropriate names for your platform.
 
     Windows utilization calculation:
-      psutil does not expose a single "busy_time" counter on Windows.
-      Instead we sum read_time + write_time (both in milliseconds) and
-      compute: delta_ms / interval_ms * 100.  This can exceed 100% on
-      multi-queue NVMe drives, so we cap at 100%.
+      psutil's read_time/write_time counters are unreliable on many Windows
+      systems (NVMe, Storage Spaces, certain RAID controllers) -- they may
+      always return 0.  As a fallback, we use bytes-based throughput:
+        throughput_MB_s / DISK_MAX_THROUGHPUT_MB * 100
+      capped at 100%.  The time-based method is tried first; if the delta
+      is zero for all devices, we fall back to the bytes method automatically.
     """
 
     BACKEND_PROCFS = "procfs"
     BACKEND_PSUTIL = "psutil"
 
     def __init__(self, devices, proc_path="/host/proc/diskstats",
-                 sample_seconds=2):
+                 sample_seconds=2, max_throughput_mb=200):
         self.devices = devices
         self.proc_path = proc_path
         self.sample_seconds = sample_seconds
+        self.max_throughput_mb = max_throughput_mb
         self._backend = self._detect_backend()
+        self._time_counters_work = True  # assume time counters work until proven otherwise
 
     def _detect_backend(self):
         """Choose the best I/O backend for the current platform."""
@@ -726,12 +731,11 @@ class DiskMonitor:
     # -- Backend: psutil (Windows / macOS) ---------------------------------
 
     def _read_io_psutil(self):
-        """Read cumulative I/O time (ms) from psutil for each device.
+        """Read cumulative I/O counters from psutil for each device.
 
-        Returns dict of {device_name: busy_time_ms}.
-        On Windows, psutil has no dedicated busy_time field, so we
-        approximate by summing read_time + write_time (both in ms).
-        On macOS / Linux-via-psutil, the same approach works.
+        Returns dict of {device_name: (time_ms, total_bytes)}.
+        time_ms = read_time + write_time (cumulative ms, may be 0 on Windows).
+        total_bytes = read_bytes + write_bytes (always reliable).
         """
         result = {}
         try:
@@ -739,10 +743,9 @@ class DiskMonitor:
             for dev_name in self.devices:
                 if dev_name in counters:
                     c = counters[dev_name]
-                    # read_time + write_time gives total ms the disk was busy.
-                    # This can double-count on parallel queues, which is why
-                    # we cap utilization at 100% in get_utilization().
-                    result[dev_name] = c.read_time + c.write_time
+                    time_ms = c.read_time + c.write_time
+                    total_bytes = c.read_bytes + c.write_bytes
+                    result[dev_name] = (time_ms, total_bytes)
         except Exception as e:
             log.warning(f"Error reading disk stats via psutil: {e}")
         return result
@@ -769,13 +772,50 @@ class DiskMonitor:
         after = self._read_io()
         interval_ms = self.sample_seconds * 1000
         max_busy = 0.0
-        for dev in self.devices:
-            if dev in before and dev in after:
-                delta = after[dev] - before[dev]
-                busy_pct = min((delta / interval_ms) * 100, 100.0)
-                if busy_pct > max_busy:
-                    max_busy = busy_pct
-                log.debug(f"  Disk {dev}: {busy_pct:.1f}% busy")
+
+        if self._backend == self.BACKEND_PSUTIL:
+            # psutil returns (time_ms, total_bytes) tuples
+            max_busy_time = 0.0
+            max_busy_bytes = 0.0
+            for dev in self.devices:
+                if dev in before and dev in after:
+                    time_before, bytes_before = before[dev]
+                    time_after, bytes_after = after[dev]
+                    # Time-based utilization
+                    time_delta = time_after - time_before
+                    time_pct = min((time_delta / interval_ms) * 100, 100.0) if interval_ms > 0 else 0.0
+                    if time_pct > max_busy_time:
+                        max_busy_time = time_pct
+                    # Bytes-based utilization (throughput as % of max)
+                    bytes_delta = bytes_after - bytes_before
+                    interval_s = self.sample_seconds if self.sample_seconds > 0 else 1
+                    throughput_mb = (bytes_delta / (1024 * 1024)) / interval_s
+                    ceiling = self.max_throughput_mb if self.max_throughput_mb > 0 else 200
+                    bytes_pct = min((throughput_mb / ceiling) * 100, 100.0)
+                    if bytes_pct > max_busy_bytes:
+                        max_busy_bytes = bytes_pct
+                    log.debug(f"  Disk {dev}: time={time_pct:.1f}% "
+                              f"throughput={throughput_mb:.1f} MB/s ({bytes_pct:.1f}%)")
+
+            if max_busy_time > 0 and self._time_counters_work:
+                max_busy = max_busy_time
+            else:
+                if self._time_counters_work and max_busy_bytes > 0:
+                    self._time_counters_work = False
+                    log.info("Disk monitoring: time-based counters returned 0 "
+                             "-- switching to throughput-based estimation "
+                             f"(ceiling: {self.max_throughput_mb} MB/s)")
+                max_busy = max_busy_bytes
+        else:
+            # procfs backend returns plain int (io_ticks ms)
+            for dev in self.devices:
+                if dev in before and dev in after:
+                    delta = after[dev] - before[dev]
+                    busy_pct = min((delta / interval_ms) * 100, 100.0)
+                    if busy_pct > max_busy:
+                        max_busy = busy_pct
+                    log.debug(f"  Disk {dev}: {busy_pct:.1f}% busy")
+
         return max_busy
 
     def test(self):
@@ -911,7 +951,8 @@ def main():
 
     disk = None
     if DISK_DEVICES:
-        disk = DiskMonitor(DISK_DEVICES, DISK_PROC_PATH, DISK_SAMPLE_SECONDS)
+        disk = DiskMonitor(DISK_DEVICES, DISK_PROC_PATH, DISK_SAMPLE_SECONDS,
+                           DISK_MAX_THROUGHPUT_MB)
         disk.test()
     else:
         log.info("Disk I/O monitoring: not configured (skipping)")
