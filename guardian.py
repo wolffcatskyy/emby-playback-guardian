@@ -797,15 +797,17 @@ class DiskMonitor:
                     log.debug(f"  Disk {dev}: time={time_pct:.1f}% "
                               f"throughput={throughput_mb:.1f} MB/s ({bytes_pct:.1f}%)")
 
-            if max_busy_time > 0 and self._time_counters_work:
-                max_busy = max_busy_time
-            else:
-                if self._time_counters_work and max_busy_bytes > 0:
-                    self._time_counters_work = False
-                    log.info("Disk monitoring: time-based counters returned 0 "
-                             "-- switching to throughput-based estimation "
-                             f"(ceiling: {self.max_throughput_mb} MB/s)")
-                max_busy = max_busy_bytes
+            # Use max(time_pct, bytes_pct) as the aggregate:
+            # - time_pct is the gold standard when Windows counters work
+            # - bytes_pct is the reliable fallback on systems with broken time counters
+            # Taking the max per-device and then the peak across devices gives us
+            # the best possible reading regardless of which counters work.
+            max_busy = max(max_busy_time, max_busy_bytes)
+            if max_busy_time == 0.0 and max_busy_bytes > 0 and self._time_counters_work:
+                self._time_counters_work = False
+                log.info("Disk monitoring: time-based counters returned 0 "
+                         "-- using throughput-based estimation as primary "
+                         f"(ceiling: {self.max_throughput_mb} MB/s)")
         else:
             # procfs backend returns plain int (io_ticks ms)
             for dev in self.devices:
