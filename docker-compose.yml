@@ -23,6 +23,7 @@ services:
       # Behavior
       POLL_INTERVAL: "30"
       STUCK_SCAN_TIMEOUT: "7200"
+      DOWNLOAD_THROTTLE_REQUIRES_PLAYBACK_AND_IO: "false"
       DRY_RUN: "true"
       TZ: "America/New_York"
     ports:

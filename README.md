@@ -74,7 +74,10 @@ services:
       SABNZBD_URL: "http://sabnzbd:8085"
       SABNZBD_API_KEY: "your-sabnzbd-key"
       SABNZBD_THROTTLE_PCT: "50"         # throttle to 50% during playback
+      DOWNLOAD_THROTTLE_REQUIRES_PLAYBACK_AND_IO: "false"
 ```
+
+By default, download throttling uses the original behavior: playback active **or** disk I/O above `IO_THRESHOLD`. Set `DOWNLOAD_THROTTLE_REQUIRES_PLAYBACK_AND_IO=true` to throttle downloads only when playback is active **and** disk I/O is saturated.
 
 ### Adding Disk I/O Monitoring
 
@@ -206,6 +209,7 @@ All configuration is via environment variables. Only `EMBY_URL` and `EMBY_API_KE
 | `STUCK_SCAN_TIMEOUT` | Absolute timeout in seconds before a task is killed | `7200` |
 | `STUCK_STALL_MINUTES` | Minutes with no progress change before task is killed (0=disabled) | `15` |
 | `IO_THRESHOLD` | Disk I/O busy percentage to trigger download throttling | `80` |
+| `DOWNLOAD_THROTTLE_REQUIRES_PLAYBACK_AND_IO` | If `true`, downloads throttle only when playback is active and disk I/O is above `IO_THRESHOLD`; if `false`, downloads keep the original playback-or-I/O behavior | `false` |
 | `DRY_RUN` | Log actions without executing them (`true`/`false`) | `false` |
 | `LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
 | `PAUSABLE_TASKS` | Comma-separated task names to pause during playback | `Scan media library,Refresh Guide,Download subtitles,Video preview thumbnail extraction,Scan Metadata Folder` |

@@ -87,6 +87,9 @@ POLL_INTERVAL = env_int("POLL_INTERVAL", 30)
 STUCK_SCAN_TIMEOUT = env_int("STUCK_SCAN_TIMEOUT", 7200)
 STUCK_STALL_MINUTES = env_int("STUCK_STALL_MINUTES", 15)
 IO_THRESHOLD = env_int("IO_THRESHOLD", 80)
+DOWNLOAD_THROTTLE_REQUIRES_PLAYBACK_AND_IO = env_bool(
+    "DOWNLOAD_THROTTLE_REQUIRES_PLAYBACK_AND_IO", False
+)
 DRY_RUN = env_bool("DRY_RUN", False)
 LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 
@@ -1247,6 +1250,10 @@ def main():
              f"Stuck timeout: {STUCK_SCAN_TIMEOUT}s | "
              f"Stall detection: {STUCK_STALL_MINUTES}min | "
              f"I/O threshold: {IO_THRESHOLD}%")
+    if DOWNLOAD_THROTTLE_REQUIRES_PLAYBACK_AND_IO:
+        log.info("Download throttle mode: playback active AND disk I/O saturated")
+    else:
+        log.info("Download throttle mode: playback active OR disk I/O saturated")
     log.info(f"Retry config: {MAX_RETRIES} retries, "
              f"backoff={RETRY_BACKOFF}x, base_delay={RETRY_BASE_DELAY}s")
     log.info(f"Pausable tasks: {', '.join(PAUSABLE_TASKS)}")
@@ -1365,15 +1372,21 @@ def main():
                     state.clear_paused_tasks()
 
             io_saturated = disk_busy > IO_THRESHOLD
-            should_throttle = playback_active or io_saturated
+            if DOWNLOAD_THROTTLE_REQUIRES_PLAYBACK_AND_IO:
+                should_throttle = playback_active and io_saturated
+            else:
+                should_throttle = playback_active or io_saturated
 
-            if should_throttle and not state.downloads_throttled:
+            def throttle_reason():
                 reasons = []
                 if playback_active:
                     reasons.append("playback active")
                 if io_saturated:
                     reasons.append(f"disk I/O {disk_busy:.0f}%")
-                reason = ", ".join(reasons)
+                return ", ".join(reasons)
+
+            if should_throttle and not state.downloads_throttled:
+                reason = throttle_reason()
                 log.info(f"Throttling downloads ({reason})")
 
                 if qbit:
