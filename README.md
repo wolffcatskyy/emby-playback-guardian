@@ -30,7 +30,7 @@ Download clients make it worse. SABnzbd and qBittorrent saturate disk throughput
 - **Stuck Task Detection** -- Kills tasks that stall (no progress change) or exceed absolute timeout
 - **Download Throttling** -- Throttles qBittorrent and SABnzbd when playback is active or disk I/O is saturated
 - **Auto-Restore** -- Restores normal operation when playback ends and system load normalizes
-- **Disk I/O Monitoring** -- Cross-platform disk I/O monitoring (Linux via `/proc/diskstats`, Windows/macOS via `psutil`)
+- **Disk I/O Monitoring** -- Cross-platform disk I/O monitoring (Linux via `/proc/diskstats`, Windows via PhysicalDisk counters, macOS via `psutil`)
 - **Notifications** -- Discord and generic webhook notifications for key events
 - **Health & Metrics** -- Built-in `/health` and `/metrics` endpoints for Prometheus scraping
 - **Startup Resilience** -- Retries connecting to Emby/Jellyfin on startup instead of exiting immediately
@@ -83,7 +83,7 @@ Disk I/O monitoring works cross-platform. The backend is auto-detected:
 | Platform | Backend | Device name examples |
 |----------|---------|---------------------|
 | Linux | `/proc/diskstats` (native, zero extra deps) | `sda`, `sdb`, `nvme0n1` |
-| Windows | `psutil` | `PhysicalDrive0`, `PhysicalDrive1`, `C:`, `D:` |
+| Windows | `typeperf` / Windows PhysicalDisk counters | `7`, `PhysicalDrive7`, `PhysicalDisk7`, `M:` |
 | macOS | `psutil` | `disk0`, `disk1` |
 
 **Linux (Docker):**
@@ -101,14 +101,38 @@ Disk I/O monitoring works cross-platform. The backend is auto-detected:
 
 ```yaml
     environment:
-      DISK_DEVICES: "PhysicalDrive0"     # or "C:" -- check device names with psutil
+      DISK_DEVICES: "M:"                 # drive letters, disk numbers, PhysicalDriveN, or mixed formats
       IO_THRESHOLD: "80"
 ```
 
-To discover available device names on Windows, run:
-```python
-import psutil
-print(list(psutil.disk_io_counters(perdisk=True).keys()))
+Windows uses native PhysicalDisk counters, the same counter family Task Manager uses for disk active time. `DISK_DEVICES` is whitespace-tolerant, so these are equivalent:
+
+```env
+DISK_DEVICES=1,2,7
+DISK_DEVICES=1, 2, 7
+```
+
+Accepted Windows formats can be mixed:
+
+```env
+DISK_DEVICES=D:,X:,M:
+DISK_DEVICES=PhysicalDrive1,PhysicalDrive2,PhysicalDrive7
+DISK_DEVICES=1,2,7
+DISK_DEVICES=X:, M:, PhysicalDrive1, PhysicalDrive2, 8
+```
+
+To inspect available Windows counters, run:
+
+```powershell
+typeperf "\PhysicalDisk(*)\% Disk Time" -sc 2
+typeperf "\PhysicalDisk(*)\Disk Bytes/sec" -sc 2
+```
+
+Modern Windows systems usually have these counters enabled already. If you need to check or enable them:
+
+```powershell
+diskperf
+diskperf -y
 ```
 
 ### Adding Notifications
@@ -129,7 +153,7 @@ print(list(psutil.disk_io_counters(perdisk=True).keys()))
          +----------+----------+
          |                     |
    Check Emby API        Check disk I/O
-   for active sessions   (procfs or psutil)
+   for active sessions   (procfs/typeperf/psutil)
          |                     |
          v                     v
    Playback active?      I/O > threshold?
@@ -206,7 +230,7 @@ All configuration is via environment variables. Only `EMBY_URL` and `EMBY_API_KE
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DISK_DEVICES` | Comma-separated device names (Linux: `sda,sdb`, Windows: `PhysicalDrive0`, macOS: `disk0`) | _(empty)_ |
+| `DISK_DEVICES` | Comma-separated device names (Linux: `sda,sdb`; Windows: `M:`, `7`, `PhysicalDrive7`, or mixed formats; macOS: `disk0`) | _(empty)_ |
 | `DISK_PROC_PATH` | Path to diskstats (use `/host/proc/diskstats` in Docker) | `/host/proc/diskstats` |
 | `DISK_SAMPLE_SECONDS` | Seconds to sample disk I/O per cycle | `2` |
 

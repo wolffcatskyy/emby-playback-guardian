@@ -11,6 +11,8 @@ Monitors Emby/Jellyfin media servers and automatically:
 https://github.com/wolffcatskyy/emby-playback-guardian
 """
 
+import csv
+import io
 import json
 import logging
 import os
@@ -26,8 +28,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 
-# psutil is optional -- required for disk I/O monitoring on Windows/macOS,
-# not needed on Linux (which reads /proc/diskstats directly).
+# psutil is optional -- used for macOS disk I/O monitoring and as a fallback
+# on Windows. Linux reads /proc/diskstats directly.
 try:
     import psutil
     _HAS_PSUTIL = True
@@ -656,24 +658,26 @@ class DiskMonitor:
 
     Supports three backends, auto-selected by platform:
       - "procfs"  (Linux): reads /proc/diskstats directly -- zero extra deps
-      - "psutil"  (Windows/macOS): uses psutil.disk_io_counters(perdisk=True)
+      - "typeperf" (Windows): reads native PhysicalDisk performance counters
+      - "psutil"  (macOS, Windows fallback): uses psutil.disk_io_counters(perdisk=True)
       - None      (unsupported): logs a warning, returns 0% utilization
 
-    On Windows, psutil device names are like "PhysicalDrive0" or "C:".
+    On Windows, DISK_DEVICES may use disk numbers, PhysicalDriveN,
+    PhysicalDiskN, drive letters, or a comma-separated mix of those forms.
     On macOS, names are like "disk0", "disk1".
     Configure DISK_DEVICES with the appropriate names for your platform.
 
     Windows utilization calculation:
       psutil's read_time/write_time counters are unreliable on many Windows
       systems (NVMe, Storage Spaces, certain RAID controllers) -- they may
-      always return 0.  As a fallback, we use bytes-based throughput:
-        throughput_MB_s / DISK_MAX_THROUGHPUT_MB * 100
-      capped at 100%.  The time-based method is tried first; if the delta
-      is zero for all devices, we fall back to the bytes method automatically.
+      always return 0. Windows therefore prefers typeperf PhysicalDisk
+      counters, which report active time like Task Manager. If typeperf is
+      unavailable, the existing psutil time/throughput estimate is used.
     """
 
     BACKEND_PROCFS = "procfs"
     BACKEND_PSUTIL = "psutil"
+    BACKEND_TYPEPERF = "typeperf"
 
     def __init__(self, devices, proc_path="/host/proc/diskstats",
                  sample_seconds=2, max_throughput_mb=200):
@@ -683,6 +687,7 @@ class DiskMonitor:
         self.max_throughput_mb = max_throughput_mb
         self._backend = self._detect_backend()
         self._time_counters_work = True  # assume time counters work until proven otherwise
+        self._last_windows_typeperf_matched = None
 
     def _detect_backend(self):
         """Choose the best I/O backend for the current platform."""
@@ -692,7 +697,10 @@ class DiskMonitor:
             # Prefer native /proc/diskstats -- no extra dependency needed
             return self.BACKEND_PROCFS
 
-        if system in ("Windows", "Darwin"):
+        if system == "Windows":
+            return self.BACKEND_TYPEPERF
+
+        if system == "Darwin":
             if _HAS_PSUTIL:
                 return self.BACKEND_PSUTIL
             log.warning(
@@ -728,7 +736,7 @@ class DiskMonitor:
             log.warning(f"Error reading disk stats: {e}")
         return result
 
-    # -- Backend: psutil (Windows / macOS) ---------------------------------
+    # -- Backend: psutil (Windows fallback / macOS) ------------------------
 
     def _read_io_psutil(self):
         """Read cumulative I/O counters from psutil for each device.
@@ -760,20 +768,257 @@ class DiskMonitor:
             return self._read_io_psutil()
         return {}
 
+    def _get_windows_typeperf_utilization(self):
+        """
+        Read real Windows PhysicalDisk activity using typeperf.
+
+        Returns max % Disk Time for configured disks.
+
+        Also logs:
+          - active time %
+          - throughput MB/s
+
+        Accepts DISK_DEVICES values like:
+          D:
+          M:
+          PhysicalDrive7
+          7
+        """
+
+        try:
+            self._last_windows_typeperf_matched = None
+            result = subprocess.run(
+                [
+                    "typeperf",
+                    r"\PhysicalDisk(*)\% Disk Time",
+                    r"\PhysicalDisk(*)\Disk Bytes/sec",
+                    "-sc",
+                    "2",
+                    "-si",
+                    str(max(1, int(self.sample_seconds))),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=max(10, int(self.sample_seconds) + 5),
+            )
+
+            if result.returncode != 0:
+                log.warning(f"typeperf failed: {result.stderr.strip()}")
+                return None
+
+            rows = list(csv.reader(io.StringIO(result.stdout)))
+
+            header = None
+            data_rows = []
+
+            for row in rows:
+                if not row:
+                    continue
+
+                if any("PhysicalDisk(" in col for col in row):
+                    header = row
+                    continue
+
+                if header is not None and len(row) == len(header):
+                    data_rows.append(row)
+
+            if header is None or not data_rows:
+                log.warning(f"Disk monitoring: could not parse typeperf output: {result.stdout!r}")
+                return None
+
+            values = data_rows[-1]
+
+            def normalize_config_device(value):
+                value = str(value).strip().lower()
+
+                # Accept accidental / alternative names:
+                #   PhysicalDrive7
+                #   physicaldrive7
+                #   PhysicalDisk7
+                #   physicaldisk7
+                if value.startswith("physicaldrive"):
+                    value = value.replace("physicaldrive", "", 1)
+
+                elif value.startswith("physicaldisk"):
+                    value = value.replace("physicaldisk", "", 1)
+
+                return value.strip()
+
+            def parse_counter_name(counter_name):
+                """
+                Example input:
+                  \\\\CBUCUR\\PhysicalDisk(7 M:)\\% Disk Time
+                  \\\\CBUCUR\\PhysicalDisk(7 M:)\\Disk Bytes/sec
+
+                Returns:
+                  instance="7 M:"
+                  counter="% disk time"
+                """
+
+                if "PhysicalDisk(" not in counter_name:
+                    return None, None
+
+                instance = counter_name.split("PhysicalDisk(", 1)[1].split(")", 1)[0].strip()
+                counter = counter_name.rsplit("\\", 1)[-1].strip().lower()
+
+                return instance, counter
+
+            def parse_instance(instance):
+                """
+                Examples:
+                  "7 M:"     -> disk_number="7", drive_letters={"m:"}
+                  "1"        -> disk_number="1", drive_letters=set()
+                  "0 C: E:"  -> disk_number="0", drive_letters={"c:", "e:"}
+                """
+
+                instance_l = instance.lower().strip()
+                parts = instance_l.split()
+
+                disk_number = parts[0] if parts else ""
+                drive_letters = {
+                    p
+                    for p in parts[1:]
+                    if len(p) == 2 and p[1] == ":"
+                }
+
+                return instance_l, disk_number, drive_letters
+
+            def format_instance(instance):
+                instance_l, disk_number, drive_letters = parse_instance(instance)
+
+                if instance_l == "_total":
+                    return "_Total"
+
+                if drive_letters:
+                    return f"PhysicalDrive{disk_number} ({', '.join(sorted(drive_letters)).upper()})"
+
+                return f"PhysicalDrive{disk_number}"
+
+            wanted = {
+                normalize_config_device(d)
+                for d in self.devices
+                if str(d).strip()
+            }
+
+            disk_data = {}
+            discovered_instances = set()
+
+            for counter_name, raw_value in zip(header[1:], values[1:]):
+                instance, counter = parse_counter_name(counter_name)
+
+                if not instance or not counter:
+                    continue
+
+                instance_l, disk_number, drive_letters = parse_instance(instance)
+                discovered_instances.add(instance)
+
+                if instance_l == "_total":
+                    continue
+
+                matched = False
+
+                for dev in wanted:
+                    if dev == disk_number:
+                        matched = True
+                        break
+
+                    if dev in drive_letters:
+                        matched = True
+                        break
+
+                    if dev == instance_l:
+                        matched = True
+                        break
+
+                if not matched:
+                    continue
+
+                try:
+                    value = float(raw_value)
+                except ValueError:
+                    continue
+
+                if instance not in disk_data:
+                    disk_data[instance] = {
+                        "active_time": 0.0,
+                        "bytes_per_sec": 0.0,
+                    }
+
+                if counter == "% disk time":
+                    disk_data[instance]["active_time"] = max(0.0, min(value, 100.0))
+
+                elif counter == "disk bytes/sec":
+                    disk_data[instance]["bytes_per_sec"] = max(0.0, value)
+
+            if not disk_data:
+                discovered = sorted(
+                    format_instance(instance)
+                    for instance in discovered_instances
+                    if parse_instance(instance)[0] != "_total"
+                )
+                log.warning(
+                    "Disk monitoring: no configured Windows PhysicalDisk instances matched. "
+                    f"configured={sorted(wanted)}, discovered={discovered}"
+                )
+                self._last_windows_typeperf_matched = False
+                return 0.0
+
+            max_busy = 0.0
+
+            for instance in sorted(
+                disk_data.keys(),
+                key=lambda x: int(parse_instance(x)[1]) if parse_instance(x)[1].isdigit() else 9999,
+            ):
+                active_time = disk_data[instance]["active_time"]
+                bytes_per_sec = disk_data[instance]["bytes_per_sec"]
+                mb_per_sec = bytes_per_sec / 1024 / 1024
+
+                max_busy = max(max_busy, active_time)
+
+                log.debug(
+                    f" Disk {format_instance(instance):<22} "
+                    f"active={active_time:6.1f}%  "
+                    f"throughput={mb_per_sec:8.2f} MB/s"
+                )
+
+            self._last_windows_typeperf_matched = True
+            return max_busy
+
+        except Exception as e:
+            log.warning(f"Error reading Windows disk activity via typeperf: {e}")
+            return None
+
     def get_utilization(self):
         """Sample disk I/O over self.sample_seconds, return max busy %."""
+
+        if platform.system() == "Windows":
+            busy = self._get_windows_typeperf_utilization()
+            if busy is not None:
+                return busy
+
+            if not _HAS_PSUTIL:
+                return 0.0
+
+            log.warning("Disk monitoring: falling back to psutil on Windows")
+
         if self._backend is None:
             return 0.0
 
-        before = self._read_io()
+        if platform.system() == "Windows" and self._backend == self.BACKEND_TYPEPERF:
+            before = self._read_io_psutil()
+        else:
+            before = self._read_io()
         if not before:
             return 0.0
         time.sleep(self.sample_seconds)
-        after = self._read_io()
+        if platform.system() == "Windows" and self._backend == self.BACKEND_TYPEPERF:
+            after = self._read_io_psutil()
+        else:
+            after = self._read_io()
         interval_ms = self.sample_seconds * 1000
         max_busy = 0.0
 
-        if self._backend == self.BACKEND_PSUTIL:
+        if self._backend in (self.BACKEND_PSUTIL, self.BACKEND_TYPEPERF):
             # psutil returns (time_ms, total_bytes) tuples
             max_busy_time = 0.0
             max_busy_bytes = 0.0
@@ -828,7 +1073,25 @@ class DiskMonitor:
 
         log.info(f"Disk monitoring: using '{self._backend}' backend "
                  f"on {platform.system()}")
-        ticks = self._read_io()
+
+        if self._backend == self.BACKEND_TYPEPERF:
+            busy = self._get_windows_typeperf_utilization()
+            if busy is not None and self._last_windows_typeperf_matched:
+                log.info("Disk monitoring: Windows PhysicalDisk counters are available")
+                return True
+
+            if busy is not None:
+                return False
+
+            if not _HAS_PSUTIL:
+                return False
+
+            log.warning("Disk monitoring: typeperf unavailable, testing psutil fallback")
+
+        if self._backend == self.BACKEND_TYPEPERF:
+            ticks = self._read_io_psutil()
+        else:
+            ticks = self._read_io()
         if ticks:
             log.info(f"Disk monitoring: {len(ticks)} device(s) found "
                      f"({', '.join(ticks.keys())})")

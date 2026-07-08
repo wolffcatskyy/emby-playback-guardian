@@ -33,14 +33,15 @@ Enable disk I/O monitoring for Windows users running Docker Desktop (WSL2 backen
 The current implementation reads from `/proc/diskstats`, which is Linux-specific. Windows users cannot use disk I/O-based throttling, only playback-based throttling.
 
 **Solution:**
-Use `psutil.disk_io_counters()` to provide cross-platform disk monitoring. The guardian will detect the OS at runtime and use the appropriate method:
+Use platform-specific disk monitoring. The guardian will detect the OS at runtime and use the appropriate method:
 - **Linux:** `/proc/diskstats` (current method, unchanged)
-- **Windows:** `psutil.disk_io_counters()` via WMI
+- **Windows:** `typeperf` / native PhysicalDisk counters
+- **macOS:** `psutil.disk_io_counters()`
 
 **Implementation steps:**
-1. Add `psutil` to `requirements.txt` (already used elsewhere in some deployments)
-2. Refactor `DiskMonitor` class to abstract the I/O source
-3. Add `WindowsDiskMonitor` subclass using `psutil`
+1. Refactor `DiskMonitor` class to abstract the I/O source
+2. Add Windows PhysicalDisk active-time support using `typeperf`
+3. Match Windows devices by disk number, `PhysicalDriveN`, `PhysicalDiskN`, or drive letter
 4. Auto-detect platform and instantiate the correct monitor
 5. Update documentation with Windows-specific examples
 
