@@ -1,5 +1,15 @@
 # Roadmap
 
+_Refreshed September 23, 2026. Plans, not promises: priorities can shift with user feedback._
+
+- Next: integration tests against mocked Emby/Jellyfin, qBittorrent, and SABnzbd APIs; failure-mode tests for outages and stale sessions.
+- Then: dry-run decisions, Prometheus alerts, and a support bundle.
+- Later: per-user/policy profiles and richer notification targets, preserving its lightweight single-purpose design.
+
+---
+
+## Earlier roadmap notes
+
 This document outlines released and planned features for Emby Playback Guardian.
 
 ## Current Version
