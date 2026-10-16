@@ -1,0 +1,61 @@
+name: Build and publish Python package
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build and check distributions
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Check installed distribution
+        run: |
+          python -m venv /tmp/guardian-smoke
+          /tmp/guardian-smoke/bin/pip install dist/*.whl
+          /tmp/guardian-smoke/bin/emby-playback-guardian --help
+          /tmp/guardian-smoke/bin/emby-playback-guardian --version
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            CODE_VERSION=$(/tmp/guardian-smoke/bin/python -c 'from importlib.metadata import version; print(version("emby-playback-guardian"))')
+            test "${GITHUB_REF_NAME#v}" = "$CODE_VERSION"
+          fi
+          python -m venv /tmp/guardian-sdist
+          /tmp/guardian-sdist/bin/pip install dist/*.tar.gz
+          /tmp/guardian-sdist/bin/emby-playback-guardian --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/emby-playback-guardian
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

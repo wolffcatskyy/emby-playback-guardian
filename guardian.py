@@ -11,6 +11,7 @@ Monitors Emby/Jellyfin media servers and automatically:
 https://github.com/wolffcatskyy/emby-playback-guardian
 """
 
+import argparse
 import csv
 import io
 import json
@@ -36,7 +37,7 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 
 # --- Configuration ---------------------------------------------------------------
@@ -1177,6 +1178,10 @@ def is_pausable_task(task_name):
 # --- Main Loop -------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version",
+                        version=f"emby-playback-guardian {__version__}")
+    parser.parse_args()
     log.info(f"Emby Playback Guardian v{__version__}")
     if DRY_RUN:
         log.info("*** DRY RUN MODE -- no actions will be taken ***")
