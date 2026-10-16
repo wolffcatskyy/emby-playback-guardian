@@ -37,6 +37,32 @@ Download clients make it worse. SABnzbd and qBittorrent saturate disk throughput
 - **Dry Run Mode** -- Test the full pipeline without taking any real actions
 - **64 MB footprint** -- Single Python process, no database, minimal dependencies (`requests` + `psutil`)
 
+## Install with Python
+
+Python 3.11 or newer is required. Docker remains available below.
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install emby-playback-guardian
+emby-playback-guardian --version
+```
+
+Configure the same environment variables documented below before starting:
+
+```bash
+export EMBY_URL="http://your-server:8096"
+# Set EMBY_API_KEY securely in your environment before running.
+export DRY_RUN=true
+emby-playback-guardian
+```
+
+Start with dry run enabled and check the logs before enabling actions.
+For native Linux installations, set `DISK_PROC_PATH=/proc/diskstats` when
+using disk monitoring; `/host/proc/diskstats` is the container default.
+The process runs in the foreground; use your operating system's service
+manager if you want it to run persistently.
+
 ## Quick Start
 
 ```yaml
